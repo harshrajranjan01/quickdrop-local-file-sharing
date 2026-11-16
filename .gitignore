@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pytest-*/
+.scratchdata*/
+QuickDrop/Shared/*
+QuickDrop/Temp/*
+QuickDrop/settings.json
+QuickDrop/*.pem
+QuickDrop/*.key

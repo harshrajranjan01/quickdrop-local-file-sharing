@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#f5f6fc">
+  <meta name="referrer" content="no-referrer">
+  <title>QuickDrop — local file sharing</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/notes.css">
+  <link rel="stylesheet" href="/static/refresh.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="QuickDrop home"><span class="brand-mark">Q</span><span>quickdrop</span></a>
+      <div class="top-status"><span id="server-dot" class="status-dot"></span><span id="server-status">Connecting…</span></div>
+      <button id="theme-toggle" class="icon-button" aria-label="Toggle dark mode" title="Toggle theme">◐</button>
+    </header>
+
+    <main>
+      <section id="join-gate" class="join-gate hidden">
+        <div class="join-symbol">↗</div>
+        <h1>Join QuickDrop</h1>
+        <p>Scan the connection QR code shown on the host laptop. The room link includes a private access token.</p>
+        <div id="join-error" class="notice error hidden"></div>
+      </section>
+
+      <div id="app-content" class="hidden">
+        <section class="welcome-row">
+          <div>
+            <div class="eyebrow">LOCAL FILE SHARING</div>
+            <h1>Send files. Share links. Stay local.</h1>
+            <p class="muted">Move things between your devices and friends on the same network, without cloud storage.</p>
+          </div>
+          <div class="room-pill"><span class="pulse"></span><span>Room</span><strong id="room-label">—</strong></div>
+        </section>
+
+        <section class="overview-grid">
+          <article class="card invite-card">
+            <div class="card-heading">
+              <div><div class="eyebrow">INVITE DEVICES</div><h2>Scan to connect</h2></div>
+              <span id="connection-state" class="tag">Checking link</span>
+            </div>
+            <div class="invite-content">
+              <div id="qr-wrap" class="qr-wrap"><div class="qr-placeholder">QR</div></div>
+              <div class="invite-details">
+                <div id="secure-context-note" class="notice warning hidden">This link uses HTTP. Shared uploads work, while WebRTC may be blocked by your browser. Configure HTTPS on the host to enable direct device transfers.</div>
+                <p class="muted small">Connect to the same Wi-Fi or laptop hotspot, then scan this code.</p>
+                <label class="field-label" for="connection-url">Room link</label>
+                <div class="copy-row"><input id="connection-url" readonly value="Waiting for network…"><button id="copy-link" class="button secondary compact">Copy</button></div>
+                <div class="mini-stats"><span><strong id="device-count">0</strong> devices online</span><span id="network-name">Looking for network</span></div>
+              </div>
+            </div>
+          </article>
+          <article class="card identity-card">
+            <div class="card-heading"><div><div class="eyebrow">YOUR DEVICE</div><h2>Identity</h2></div><span class="self-badge">YOU</span></div>
+            <label class="field-label" for="device-name">Device name</label>
+            <div class="copy-row"><input id="device-name" maxlength="64" placeholder="This device"><button id="save-name" class="button secondary compact">Save</button></div>
+            <div class="identity-meta"><span class="device-glyph" id="own-device-glyph">▣</span><div><strong id="identity-name">This device</strong><small id="identity-type">Browser device</small><small id="device-id-label" class="device-id-label"></small></div><span class="online-label"><i></i> Online</span></div>
+            <div class="host-only" id="host-label">This laptop is hosting the room.</div>
+          </article>
+        </section>
+
+        <nav class="tabs" aria-label="QuickDrop sections">
+          <button class="tab active" data-view="devices-view"><span>↗</span> Device transfer <b id="tab-device-count">0</b></button>
+          <button class="tab" data-view="shared-view"><span>▤</span> Shared files <b id="tab-file-count">0</b></button>
+          <button class="tab" data-view="notes-view"><span>▧</span> Notes &amp; Links <b id="notes-unread" class="hidden">0</b></button>
+          <button class="tab" data-view="network-view"><span>⌁</span> Network</button>
+        </nav>
+
+        <section id="devices-view" class="view active-view">
+          <div class="section-heading"><div><div class="eyebrow">DEVICE TO DEVICE</div><h2>Send to a nearby device</h2></div><div id="peer-support" class="subtle-pill">WebRTC direct · relay fallback</div></div>
+          <div class="device-layout">
+            <article class="card device-card">
+              <div class="card-heading"><div><h3>Connected devices</h3><p class="muted small">Step 1 · Choose who should receive your files.</p></div><button id="refresh-devices" class="icon-button" title="Refresh devices">↻</button></div>
+              <div id="devices-list" class="devices-list"><div class="empty-state">Waiting for devices to join…</div></div>
+            </article>
+            <article class="card send-card">
+              <div class="eyebrow">STEP 2 · NEW TRANSFER</div><h3>Choose files to send</h3>
+              <label class="drop-zone" id="peer-drop-zone" for="peer-files"><span class="upload-icon">↑</span><strong>Drop files here</strong><span>or browse from this device</span><input id="peer-files" type="file" multiple></label>
+              <div id="peer-file-summary" class="file-summary">No files selected</div>
+              <button id="send-files" class="button primary full" disabled>Choose a recipient</button>
+              <p class="footnote">The recipient must accept before transfer begins. A laptop relay is used if direct WebRTC is unavailable.</p>
+            </article>
+          </div>
+          <section class="transfer-area"><div class="section-heading compact-heading"><div><div class="eyebrow">ACTIVITY</div><h2>Incoming and outgoing</h2></div></div><div id="transfers-list" class="transfers-list"><div class="empty-state">Transfers will appear here.</div></div></section>
+        </section>
+
+        <section id="shared-view" class="view">
+          <div class="section-heading"><div><div class="eyebrow">SERVER MODE</div><h2>Files available in this room</h2><p class="muted">Uploads are stored on the host laptop for everyone to download.</p></div><div class="file-actions"><button id="select-all" class="button secondary compact">Select all</button><button id="deselect-all" class="button secondary compact">Deselect</button><button id="delete-selected" class="button danger compact host-only" disabled>Delete selected (0)</button></div></div>
+          <article class="card upload-card">
+            <label class="drop-zone wide" id="server-drop-zone" for="server-files"><span class="upload-icon">↑</span><strong>Drop files to upload to the host</strong><span>or choose files · maximum <b id="max-size-label">2048 MB per file</b></span><input id="server-files" type="file" multiple></label>
+            <div id="upload-progress-list" class="progress-list"></div>
+          </article>
+          <article class="card files-card">
+            <div class="card-heading files-header"><div><h3>Shared folder <span id="shared-count" class="count-chip">0</span></h3><p class="muted small" id="shared-path">QuickDrop / Shared</p></div><button id="download-zip" class="button primary" disabled>↓ Download selected as ZIP <span id="selected-count">0</span></button></div>
+            <div id="shared-files-list" class="shared-files-list"><div class="empty-state">No shared files yet. Upload something to get started.</div></div>
+          </article>
+        </section>
+
+        <section id="notes-view" class="view">
+          <div class="section-heading"><div><div class="eyebrow">CLIPBOARD &amp; NOTES</div><h2>Share a note or link</h2><p class="muted">Send a quick message or link to a connected device.</p></div></div>
+          <div class="notes-layout">
+            <article class="card notes-compose-card">
+              <div class="eyebrow">NEW NOTE</div><h3>Write or paste something</h3>
+              <textarea id="note-text" class="note-textarea" rows="7" placeholder="Type a message, paste text, or add a link…"></textarea>
+              <div class="note-compose-actions"><button id="paste-note" class="button secondary compact">▣ Paste from clipboard</button><span id="note-character-count" class="muted small">0 characters</span></div>
+              <label class="field-label" for="note-recipient">Send to</label>
+              <div class="note-send-row"><select id="note-recipient" class="full-input"><option value="" selected>Choose a connected device</option></select><button id="send-note" class="button primary" disabled>Send</button></div>
+            </article>
+            <article class="card received-notes-card">
+              <div class="card-heading"><div><div class="eyebrow">INBOX</div><h3>Received notes <span id="received-notes-count" class="count-chip">0</span></h3></div></div>
+              <div id="received-notes-list" class="received-notes-list"><div class="empty-state">Notes from your friends will appear here.</div></div>
+            </article>
+          </div>
+        </section>
+
+        <section id="network-view" class="view">
+          <div class="section-heading"><div><div class="eyebrow">CONNECTION</div><h2>Network settings</h2><p class="muted">QuickDrop works on a local Wi-Fi network without internet access.</p></div></div>
+          <div class="network-grid">
+            <article class="card network-card">
+              <div class="network-choice"><span class="choice-icon">⌁</span><div><h3>Existing Wi-Fi</h3><p class="muted small">Use the Wi-Fi network already connected to this laptop. QuickDrop never starts a hotspot in this mode.</p></div><span id="wifi-mode-tag" class="active-tag">Current mode</span></div>
+              <div class="network-detail"><span>Active interface</span><strong id="active-interface">—</strong><span>Local IP address</span><strong id="local-ip">—</strong></div>
+              <div class="host-only"><label class="field-label" for="network-interface">Interface used in the room QR</label><select id="network-interface" class="full-input"></select></div>
+              <div class="button-row"><button id="use-wifi" class="button secondary">Use existing Wi-Fi</button><button id="refresh-network" class="button secondary">Refresh details</button></div>
+              <p class="footnote">All devices need to be on the same network. Some routers block device-to-device traffic (client isolation).</p>
+            </article>
+            <article class="card network-card">
+              <div class="network-choice"><span class="choice-icon hotspot-icon">⌁</span><div><h3>Laptop hotspot</h3><p class="muted small">Create a Wi-Fi network for nearby devices. Windows may require manual activation on newer adapters.</p></div><span id="hotspot-mode-tag" class="active-tag hidden">Current mode</span></div>
+              <div class="host-only hotspot-controls">
+                <div class="hotspot-status-row"><span>Hotspot status</span><strong id="hotspot-status">Not active</strong></div>
+                <label class="field-label" for="hotspot-name">Hotspot name</label><input class="full-input" id="hotspot-name" value="QuickDrop" maxlength="32">
+                <label class="field-label" for="hotspot-password">Hotspot password (8–63 characters)</label><input class="full-input" id="hotspot-password" type="password" value="quickdrop123" minlength="8" maxlength="63">
+                <div class="button-row"><button id="start-hotspot" class="button primary">Try automatic start</button><button id="manual-hotspot" class="button secondary">Open Windows settings</button></div>
+                <div id="hotspot-message" class="notice hidden"></div>
+                <div id="wifi-qr-row" class="wifi-qr-row hidden"><img id="wifi-qr" alt="Hotspot Wi-Fi QR code"><span>Scan this first to join the laptop hotspot. Confirm the join prompt on your phone, then scan the separate room QR above.</span></div>
+              </div>
+              <div class="participant-hotspot muted small">Only the host laptop can change hotspot settings.</div>
+              <p class="footnote">Newer Windows Mobile Hotspot uses Windows Settings. After enabling it, QuickDrop detects the hotspot adapter and shows its current IP. Wi-Fi and room QR codes are separate by design.</p>
+            </article>
+            <article class="card network-card host-only">
+              <div class="eyebrow">HOST PREFERENCES</div><h3>File size limit</h3><p class="muted small">Maximum size for each server upload and device transfer.</p>
+              <div class="limit-row"><input id="max-file-mb" type="number" min="1" max="100000" value="2048"><span>MB per file</span><button id="save-limit" class="button secondary">Save</button></div>
+              <p class="footnote">The setting is saved on this laptop in QuickDrop/settings.json.</p>
+            </article>
+            <article class="card network-card">
+              <div class="eyebrow">BROWSER SUPPORT</div><h3>HTTPS and direct transfers</h3>
+              <p class="muted small">Browsers restrict WebRTC on plain HTTP LAN addresses. Set up a trusted local certificate on the host and install its CA certificate on each phone to enable direct WebRTC transfers. Server uploads and relay transfers work over HTTP.</p>
+              <p class="muted small">If devices can browse QuickDrop but cannot reach one another, the router may have client isolation enabled. Try the laptop hotspot or disable that router feature.</p>
+              <details class="turn-settings"><summary>Optional private STUN/TURN server</summary><p class="muted small">For networks where direct connections are blocked, enter a STUN or TURN URL. Leave blank for same-network connections.</p>
+                <label class="field-label" for="turn-url">Server URL (for example, turn:192.168.1.20:3478)</label><input id="turn-url" class="full-input" placeholder="turn:host:3478">
+                <label class="field-label" for="turn-user">Username</label><input id="turn-user" class="full-input" autocomplete="off">
+                <label class="field-label" for="turn-password">Password</label><input id="turn-password" class="full-input" type="password" autocomplete="new-password">
+                <button id="save-turn" class="button secondary" style="margin-top:10px">Save on this device</button>
+              </details>
+            </article>
+          </div>
+        </section>
+
+        <footer class="footer"><span>QuickDrop · files stay on your local network</span><span id="transfer-mode-footer">Direct peer transfer with laptop relay fallback</span></footer>
+      </div>
+      <div id="toast-region" class="toast-region" aria-live="polite"></div>
+    </main>
+  </div>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

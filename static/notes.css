@@ -1,0 +1,17 @@
+.notes-layout{display:grid;grid-template-columns:1fr 1fr;gap:15px}
+.notes-compose-card,.received-notes-card{min-height:300px}
+.notes-compose-card h3,.received-notes-card h3{font:700 15px Manrope,sans-serif;margin:4px 0 13px}
+.note-textarea{display:block;width:100%;min-height:150px;resize:vertical;border:1px solid var(--line);border-radius:9px;background:var(--bg);color:var(--text);font:12px/1.55 'Segoe UI',Arial,sans-serif;padding:11px;outline:none}
+.note-textarea:focus{border-color:#9ab0fc;box-shadow:0 0 0 3px #eef2ff}
+.note-compose-actions{display:flex;justify-content:space-between;align-items:center;margin-top:8px}
+.note-send-row{display:flex;gap:8px;align-items:center}
+.note-send-row select{flex:1}
+.received-notes-list{display:grid;gap:9px;margin-top:12px}
+.note-item{border:1px solid var(--line);border-radius:10px;padding:12px;background:var(--card)}
+.note-item-header{display:flex;justify-content:space-between;gap:10px;color:var(--muted);font-size:10px;margin-bottom:8px}
+.note-item-header strong{color:var(--text);font-size:11px}
+.note-text{font-size:12px;line-height:1.55;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--text)}
+.note-text a{color:var(--primary);text-decoration:underline;overflow-wrap:anywhere}
+.note-item-actions{display:flex;gap:7px;margin-top:11px}
+body.dark .note-textarea{background:#121a26}
+@media(max-width:850px){.notes-layout{grid-template-columns:1fr}}
