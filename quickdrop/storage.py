@@ -7,14 +7,18 @@ import re
 import tempfile
 import uuid
 import zipfile
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 from fastapi import UploadFile
 
 
 CHUNK_SIZE = 1024 * 1024
+RELAY_CHUNK_SIZES = (1, 2, 4, 8)
+DEFAULT_RELAY_CHUNK_SIZE = 4 * 1024 * 1024
+MAX_RELAY_CHUNK_SIZE = max(RELAY_CHUNK_SIZES) * 1024 * 1024
 _INVALID_NAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
@@ -143,25 +147,106 @@ def create_zip(shared_dir: Path, file_ids: Iterable[str], temp_dir: Path) -> Pat
         raise
 
 
-async def write_relay_chunk(path: Path, body, offset: int, expected_size: int, max_chunk: int = CHUNK_SIZE) -> int:
-    """Append a single bounded HTTP chunk and reject gaps or oversize bodies."""
+def _append_relay_payload(path: Path, payload: bytes | bytearray, offset: int, expected_size: int) -> int:
     path.parent.mkdir(parents=True, exist_ok=True)
     current = path.stat().st_size if path.exists() else 0
     if current != offset:
         raise ValueError(f"Unexpected chunk offset: expected {current}, got {offset}.")
-    written = 0
-    with path.open("ab") as output:
-        async for chunk in body:
-            written += len(chunk)
-            if written > max_chunk or current + written > expected_size:
-                raise ValueError("Relay chunk exceeds the declared file size.")
-            output.write(chunk)
-    if written == 0 and current < expected_size:
+    if current + len(payload) > expected_size:
+        raise ValueError("Relay chunk exceeds the declared file size.")
+    try:
+        with path.open("ab") as output:
+            output.write(payload)
+    except OSError:
+        try:
+            with path.open("r+b") as output:
+                output.truncate(offset)
+        except OSError:
+            pass
+        raise
+    return current + len(payload)
+
+
+async def write_relay_chunk(
+    path: Path,
+    body,
+    offset: int,
+    expected_size: int,
+    max_chunk: int = CHUNK_SIZE,
+    content_length: int | None = None,
+    on_commit: Callable[[bytes | bytearray], None] | None = None,
+) -> int:
+    """Buffer one bounded request chunk, then append it in one worker-thread write.
+
+    Nothing is appended until the request body has been read successfully. This
+    keeps interrupted requests resumable from the previous committed offset.
+    """
+    if max_chunk < 0 or max_chunk > MAX_RELAY_CHUNK_SIZE:
+        raise ValueError("Invalid relay chunk size.")
+    if content_length is not None and (content_length < 0 or content_length > max_chunk):
+        raise ValueError("Relay request body exceeds the configured chunk size.")
+    current = await asyncio.to_thread(lambda: path.stat().st_size if path.exists() else 0)
+    if current != offset:
+        raise ValueError(f"Unexpected chunk offset: expected {current}, got {offset}.")
+    payload = bytearray()
+    async for chunk in body:
+        if not chunk:
+            continue
+        if len(payload) + len(chunk) > max_chunk or current + len(payload) + len(chunk) > expected_size:
+            raise ValueError("Relay chunk exceeds the declared file size.")
+        payload.extend(chunk)
+    if content_length is not None and len(payload) != content_length:
+        raise ValueError("Relay request ended before its declared body length.")
+    if not payload and current < expected_size:
         raise ValueError("Empty relay chunk.")
-    return current + written
+    if payload or expected_size == 0:
+        written = await asyncio.to_thread(_append_relay_payload, path, payload, offset, expected_size)
+        if payload and on_commit:
+            on_commit(payload)
+        return written
+    return current
 
 
-def stream_file(path: Path, chunk_size: int = CHUNK_SIZE):
+def stream_file(path: Path, chunk_size: int = CHUNK_SIZE, offset: int = 0):
     with path.open("rb") as source:
+        source.seek(max(0, offset))
         while chunk := source.read(chunk_size):
             yield chunk
+
+
+async def stream_file_async(
+    path: Path,
+    chunk_size: int = CHUNK_SIZE,
+    offset: int = 0,
+    limit: int | None = None,
+    semaphore: asyncio.Semaphore | None = None,
+):
+    """Stream a file with bounded reads performed outside the event loop."""
+
+    async def run_io(function, *args):
+        if semaphore is None:
+            return await asyncio.to_thread(function, *args)
+        async with semaphore:
+            return await asyncio.to_thread(function, *args)
+
+    source = await run_io(path.open, "rb")
+    remaining = None if limit is None else max(0, limit)
+    try:
+        await run_io(source.seek, max(0, offset))
+        while remaining is None or remaining > 0:
+            read_size = chunk_size if remaining is None else min(chunk_size, remaining)
+            chunk = await run_io(source.read, read_size)
+            if not chunk:
+                break
+            if remaining is not None:
+                remaining -= len(chunk)
+            yield chunk
+    finally:
+        await run_io(source.close)
+
+
+def read_file_range(path: Path, offset: int, size: int) -> bytes:
+    """Read at most one bounded committed range for a live relay consumer."""
+    with path.open("rb") as source:
+        source.seek(max(0, offset))
+        return source.read(max(0, size))

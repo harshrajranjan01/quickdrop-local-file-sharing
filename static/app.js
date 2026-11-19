@@ -27,6 +27,23 @@
   const pendingNotes = new Map();
   let outgoingSelection = [];
   let connectionUrl = '';
+  const DIRECT_CHUNK_SIZE = 64 * 1024;
+  const DIRECT_CHECKPOINT_SIZE = 1024 * 1024;
+  const DIRECT_ACK_WINDOW_SIZE = 4 * 1024 * 1024;
+  const DEFAULT_RELAY_CHUNK_SIZE = 4 * 1024 * 1024;
+  const WEBRTC_DIAGNOSTICS_ENABLED = params.get('webrtc-diagnostics') === '1';
+  const WEBRTC_DIAGNOSTIC_OUTPUT = ['memory', 'file'].includes(params.get('webrtc-output')) ? params.get('webrtc-output') : 'normal';
+  const WEBRTC_DIAGNOSTIC_REPORTS = [];
+  const RELAY_BEHAVIOR_PREF = 'quickdrop-relay-behavior';
+  const LEGACY_RELAY_STREAM_PREF = 'quickdrop-live-relay';
+  let relayBehavior = loadRelayBehaviorPreference();
+  let performanceSnapshot = null;
+  const CRC32_TABLE = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let value = i;
+    for (let bit = 0; bit < 8; bit++) value = value & 1 ? (value >>> 1) ^ 0xedb88320 : value >>> 1;
+    CRC32_TABLE[i] = value >>> 0;
+  }
 
   function getDeviceId() {
     let value = localStorage.getItem('quickdrop-device-id');
@@ -35,6 +52,15 @@
       localStorage.setItem('quickdrop-device-id', value);
     }
     return value;
+  }
+
+  function loadRelayBehaviorPreference() {
+    const saved = localStorage.getItem(RELAY_BEHAVIOR_PREF);
+    if (saved === 'automatic' || saved === 'standard') return saved;
+    const previous = localStorage.getItem(LEGACY_RELAY_STREAM_PREF);
+    const migrated = previous === 'false' ? 'standard' : 'automatic';
+    localStorage.setItem(RELAY_BEHAVIOR_PREF, migrated);
+    return migrated;
   }
 
   function guessType() {
@@ -63,6 +89,259 @@
     return value.toFixed(value >= 100 ? 0 : value >= 10 ? 1 : 2) + ' ' + units[index];
   }
 
+  function prettyRate(bytesPerSecond) {
+    if (!Number.isFinite(bytesPerSecond) || bytesPerSecond <= 0) return '0 MB/s';
+    if (bytesPerSecond < 10 * 1024) return (bytesPerSecond / 1024).toFixed(1) + ' KB/s';
+    return (bytesPerSecond / (1024 * 1024)).toFixed(2) + ' MB/s';
+  }
+
+  function prettyDuration(seconds) {
+    const value = Math.max(0, Math.floor(Number(seconds) || 0));
+    if (value >= 3600) return Math.floor(value / 3600) + 'h ' + Math.floor((value % 3600) / 60) + 'm';
+    if (value >= 60) return Math.floor(value / 60) + 'm ' + (value % 60) + 's';
+    return value + ' s';
+  }
+
+  function crc32Update(state, bytes) {
+    let value = state >>> 0;
+    for (let index = 0; index < bytes.length; index++) value = CRC32_TABLE[(value ^ bytes[index]) & 0xff] ^ (value >>> 8);
+    return value >>> 0;
+  }
+
+  function crc32Hex(bytes) {
+    return ((crc32Update(0xffffffff, bytes) ^ 0xffffffff) >>> 0).toString(16).padStart(8, '0');
+  }
+
+  function diagnosticAdd(state, key, elapsedMs) {
+    const diag = state && state.webrtcDiagnostics;
+    if (!diag || !Number.isFinite(elapsedMs)) return;
+    diag.timing[key] = (diag.timing[key] || 0) + Math.max(0, elapsedMs);
+  }
+
+  function startWebRtcDiagnostics(state, pc) {
+    if (!WEBRTC_DIAGNOSTICS_ENABLED || !pc) return;
+    if (!state.webrtcDiagnostics) {
+      const report = {
+        transferId: state.id,
+        direction: state.direction === 'out' ? 'sending' : 'receiving',
+        peerName: state.peerName,
+        outputMode: state.direction === 'in' ? WEBRTC_DIAGNOSTIC_OUTPUT : 'sender',
+        files: (state.files || []).map((file) => ({ name: file.name, size: Number(file.size || 0) })),
+        startedAt: new Date().toISOString(),
+        connections: 0,
+        samples: [],
+        timingMs: {},
+      };
+      state.webrtcDiagnostics = {
+        report,
+        timing: report.timingMs,
+        pendingAckTimes: new Map(),
+        previous: null,
+        lastProgressBytes: 0,
+        lastSampleAt: 0,
+        sampling: false,
+        peakBufferedAmount: 0,
+        peakReceiverMemoryBytes: 0,
+      };
+      WEBRTC_DIAGNOSTIC_REPORTS.push(report);
+    }
+    const diag = state.webrtcDiagnostics;
+    diag.report.connections++;
+    diag.previous = null;
+    diag.pendingAckTimes.clear();
+    if (state.webrtcStatsTimer) clearInterval(state.webrtcStatsTimer);
+
+    const sample = async () => {
+      if (diag.sampling || state.pc !== pc || state.done) return;
+      diag.sampling = true;
+      try {
+        const stats = await pc.getStats();
+        const values = Array.from(stats.values());
+        const byId = new Map(values.map((item) => [item.id, item]));
+        const transport = values.find((item) => item.type === 'transport' && item.selectedCandidatePairId);
+        let pair = transport && byId.get(transport.selectedCandidatePairId);
+        if (!pair) pair = values.find((item) => item.type === 'candidate-pair' && item.selected && item.state === 'succeeded');
+        if (!pair) pair = values.find((item) => item.type === 'candidate-pair' && item.state === 'succeeded' && item.nominated);
+        const local = pair && byId.get(pair.localCandidateId);
+        const remote = pair && byId.get(pair.remoteCandidateId);
+        const channelStats = values.find((item) => item.type === 'data-channel' && (!item.label || item.label === 'quickdrop-files'));
+        const now = performance.now();
+        const previous = diag.previous;
+        const elapsed = previous ? Math.max(0.001, (now - previous.at) / 1000) : 0;
+        const sent = channelStats && Number.isFinite(channelStats.bytesSent) ? channelStats.bytesSent : null;
+        const received = channelStats && Number.isFinite(channelStats.bytesReceived) ? channelStats.bytesReceived : null;
+        const selectedPairId = pair && pair.id;
+        const pairStable = previous && previous.pairId === selectedPairId;
+        const sentRate = elapsed && sent != null && previous.sent != null ? Math.max(0, (sent - previous.sent) / elapsed) : null;
+        const receivedRate = elapsed && received != null && previous.received != null ? Math.max(0, (received - previous.received) / elapsed) : null;
+        const pairSentRate = elapsed && pairStable && Number.isFinite(pair.bytesSent) && previous.pairSent != null ? Math.max(0, (pair.bytesSent - previous.pairSent) / elapsed) : null;
+        const pairReceivedRate = elapsed && pairStable && Number.isFinite(pair.bytesReceived) && previous.pairReceived != null ? Math.max(0, (pair.bytesReceived - previous.pairReceived) / elapsed) : null;
+        const progressBytes = state.direction === 'in' && state.currentFile
+          ? state.files.slice(0, state.currentFile.index).reduce((sum, file) => sum + Number(file.size || 0), 0) + state.currentFile.received
+          : Number(state.loaded || 0);
+        const appRate = elapsed && previous ? Math.max(0, (progressBytes - previous.progressBytes) / elapsed) : null;
+        const sampleRecord = {
+          at: new Date().toISOString(),
+          elapsedSeconds: Number(((now - (diag.startedAtPerf || now)) / 1000).toFixed(1)),
+          progressBytes,
+          appThroughputBytesPerSecond: appRate,
+          peerConnectionState: pc.connectionState || null,
+          iceConnectionState: pc.iceConnectionState || null,
+          iceGatheringState: pc.iceGatheringState || null,
+          dataChannel: state.channel ? {
+            readyState: state.channel.readyState,
+            ordered: state.channel.ordered,
+            maxRetransmits: state.channel.maxRetransmits,
+            maxPacketLifeTime: state.channel.maxPacketLifeTime,
+            maxMessageSize: pc.sctp && Number.isFinite(pc.sctp.maxMessageSize) ? pc.sctp.maxMessageSize : null,
+          } : null,
+          dataChannelBytesSent: sent,
+          dataChannelBytesReceived: received,
+          dataChannelSendBytesPerSecond: sentRate,
+          dataChannelReceiveBytesPerSecond: receivedRate,
+          selectedPairSendBytesPerSecond: pairSentRate,
+          selectedPairReceiveBytesPerSecond: pairReceivedRate,
+          bufferedAmountBytes: state.channel ? state.channel.bufferedAmount : null,
+          selectedCandidatePair: pair ? {
+            id: pair.id,
+            state: pair.state || null,
+            nominated: !!pair.nominated,
+            selected: !!pair.selected,
+            candidatePairType: pair.candidatePairType || null,
+            localCandidateType: local && local.candidateType || null,
+            remoteCandidateType: remote && remote.candidateType || null,
+            localProtocol: local && local.protocol || null,
+            remoteProtocol: remote && remote.protocol || null,
+            localTcpType: local && local.tcpType || null,
+            remoteTcpType: remote && remote.tcpType || null,
+            relayProtocol: local && local.relayProtocol || remote && remote.relayProtocol || null,
+            currentRoundTripTimeMs: Number.isFinite(pair.currentRoundTripTime) ? Number((pair.currentRoundTripTime * 1000).toFixed(2)) : null,
+            packetsLost: Number.isFinite(pair.packetsLost) ? pair.packetsLost : null,
+            packetsDiscardedOnSend: Number.isFinite(pair.packetsDiscardedOnSend) ? pair.packetsDiscardedOnSend : null,
+            packetsSent: Number.isFinite(pair.packetsSent) ? pair.packetsSent : null,
+            packetsReceived: Number.isFinite(pair.packetsReceived) ? pair.packetsReceived : null,
+            requestsSent: Number.isFinite(pair.requestsSent) ? pair.requestsSent : null,
+            requestsReceived: Number.isFinite(pair.requestsReceived) ? pair.requestsReceived : null,
+            bytesSent: Number.isFinite(pair.bytesSent) ? pair.bytesSent : null,
+            bytesReceived: Number.isFinite(pair.bytesReceived) ? pair.bytesReceived : null,
+            availableOutgoingBitrate: Number.isFinite(pair.availableOutgoingBitrate) ? pair.availableOutgoingBitrate : null,
+            availableIncomingBitrate: Number.isFinite(pair.availableIncomingBitrate) ? pair.availableIncomingBitrate : null,
+          } : null,
+          processing: { ...diag.timing },
+          peakBufferedAmountBytes: diag.peakBufferedAmount,
+          peakReceiverMemoryBytes: diag.peakReceiverMemoryBytes,
+        };
+        diag.startedAtPerf ||= now;
+        diag.peakBufferedAmount = Math.max(diag.peakBufferedAmount, sampleRecord.bufferedAmountBytes || 0);
+        sampleRecord.peakBufferedAmountBytes = diag.peakBufferedAmount;
+        diag.report.samples.push(sampleRecord);
+        diag.report.latest = sampleRecord;
+        diag.previous = {
+          at: now, pairId: selectedPairId, sent, received,
+          pairSent: pair && Number.isFinite(pair.bytesSent) ? pair.bytesSent : null,
+          pairReceived: pair && Number.isFinite(pair.bytesReceived) ? pair.bytesReceived : null,
+          progressBytes,
+        };
+        renderWebRtcDiagnostics();
+      } catch (error) {
+        diag.report.statsError = error && error.message || String(error);
+      } finally {
+        diag.sampling = false;
+      }
+    };
+    sample();
+    state.webrtcStatsTimer = setInterval(sample, 1000);
+  }
+
+  function stopWebRtcDiagnostics(state) {
+    if (state && state.webrtcStatsTimer) {
+      clearInterval(state.webrtcStatsTimer);
+      state.webrtcStatsTimer = null;
+    }
+    const diag = state && state.webrtcDiagnostics;
+    if (diag && !diag.report.endedAt) {
+      diag.report.endedAt = new Date().toISOString();
+      diag.report.durationSeconds = Number(state.durationSeconds || 0);
+      diag.report.status = state.status;
+      diag.report.peakBufferedAmountBytes = diag.peakBufferedAmount;
+      diag.report.peakReceiverMemoryBytes = diag.peakReceiverMemoryBytes;
+      diag.report.timingMs = { ...diag.timing };
+      renderWebRtcDiagnostics();
+    }
+  }
+
+  function renderWebRtcDiagnostics() {
+    const card = byId('webrtc-diagnostics-card');
+    if (!WEBRTC_DIAGNOSTICS_ENABLED || !card) return;
+    card.hidden = false;
+    const modeText = WEBRTC_DIAGNOSTIC_OUTPUT === 'memory'
+      ? 'Receiver mode: memory-only — data is verified, then discarded without saving.'
+      : WEBRTC_DIAGNOSTIC_OUTPUT === 'file'
+        ? 'Receiver mode: writes directly to the folder selected when accepting.'
+        : 'Receiver mode: QuickDrop default (memory assembly followed by browser download).';
+    byId('webrtc-diagnostics-mode').textContent = modeText;
+    const reports = WEBRTC_DIAGNOSTIC_REPORTS.slice(-8).map((report) => ({
+      transferId: report.transferId,
+      direction: report.direction,
+      peerName: report.peerName,
+      outputMode: report.outputMode,
+      files: report.files,
+      startedAt: report.startedAt,
+      endedAt: report.endedAt || 'in progress',
+      durationSeconds: report.durationSeconds || null,
+      status: report.status || 'in progress',
+      connections: report.connections,
+      selectedCandidatePair: report.latest && report.latest.selectedCandidatePair || null,
+      intervalSamples: report.samples.slice(-12).map((sample) => ({
+        elapsedSeconds: sample.elapsedSeconds,
+        appMBps: sample.appThroughputBytesPerSecond == null ? null : Number((sample.appThroughputBytesPerSecond / (1024 * 1024)).toFixed(2)),
+        dataChannelSendMBps: sample.dataChannelSendBytesPerSecond == null ? null : Number((sample.dataChannelSendBytesPerSecond / (1024 * 1024)).toFixed(2)),
+        dataChannelReceiveMBps: sample.dataChannelReceiveBytesPerSecond == null ? null : Number((sample.dataChannelReceiveBytesPerSecond / (1024 * 1024)).toFixed(2)),
+        selectedPairSendMBps: sample.selectedPairSendBytesPerSecond == null ? null : Number((sample.selectedPairSendBytesPerSecond / (1024 * 1024)).toFixed(2)),
+        selectedPairReceiveMBps: sample.selectedPairReceiveBytesPerSecond == null ? null : Number((sample.selectedPairReceiveBytesPerSecond / (1024 * 1024)).toFixed(2)),
+        bufferedAmountBytes: sample.bufferedAmountBytes,
+        rttMs: sample.selectedCandidatePair && sample.selectedCandidatePair.currentRoundTripTimeMs,
+        packetsLost: sample.selectedCandidatePair && sample.selectedCandidatePair.packetsLost,
+      })),
+      peakBufferedAmountBytes: report.peakBufferedAmountBytes || 0,
+      peakReceiverMemoryBytes: report.peakReceiverMemoryBytes || 0,
+      timingMs: report.timingMs || {},
+      averageAckRoundTripMs: report.timingMs && report.timingMs.ackResponses
+        ? Number((report.timingMs.dataChannelAckRoundTrip / report.timingMs.ackResponses).toFixed(2))
+        : null,
+      statsError: report.statsError || null,
+    }));
+    byId('webrtc-diagnostics-summary').textContent = reports.length
+      ? JSON.stringify({ browser: navigator.userAgent, outputMode: WEBRTC_DIAGNOSTIC_OUTPUT, reports }, null, 2)
+      : 'Waiting for a WebRTC transfer. Candidate type and protocol will appear only after the browser selects an ICE pair.';
+  }
+
+  function initWebRtcDiagnostics() {
+    if (!WEBRTC_DIAGNOSTICS_ENABLED) return;
+    renderWebRtcDiagnostics();
+    byId('download-webrtc-report').addEventListener('click', () => {
+      const payload = {
+        capturedAt: new Date().toISOString(),
+        browser: navigator.userAgent,
+        outputMode: WEBRTC_DIAGNOSTIC_OUTPUT,
+        reports: WEBRTC_DIAGNOSTIC_REPORTS,
+      };
+      const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' }));
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = 'QuickDrop-WebRTC-diagnostics-' + new Date().toISOString().replace(/[:.]/g, '-') + '.json';
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 30000);
+    });
+    byId('clear-webrtc-report').addEventListener('click', () => {
+      WEBRTC_DIAGNOSTIC_REPORTS.splice(0, WEBRTC_DIAGNOSTIC_REPORTS.length);
+      for (const state of transfers.values()) {
+        if (state.webrtcDiagnostics) state.webrtcDiagnostics.report.samples.length = 0;
+      }
+      renderWebRtcDiagnostics();
+    });
+  }
+
   function safeFileName(name) {
     const leaf = String(name || 'upload.bin').replace(/\\/g, '/').split('/').pop();
     const safe = leaf.replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_').replace(/^[ .]+|[ .]+$/g, '').slice(0, 180);
@@ -73,6 +352,13 @@
     if (!started || !bytes) return '';
     const seconds = Math.max(0.001, (performance.now() - started) / 1000);
     return (bytes / seconds / (1024 * 1024)).toFixed(1) + ' MB/s';
+  }
+
+  function displayTransport(value) {
+    const route = String(value || '').toLowerCase();
+    if (route.includes('relay')) return 'Laptop relay';
+    if (route.includes('direct') || route.includes('webrtc')) return 'Direct WebRTC';
+    return 'Connecting';
   }
 
   function toast(message, type = '') {
@@ -86,6 +372,7 @@
   async function api(path, options = {}) {
     const headers = new Headers(options.headers || {});
     if (access) headers.set('X-Room-Token', access);
+    headers.set('X-Device-ID', deviceId);
     const response = await fetch(path, { ...options, headers });
     const type = response.headers.get('content-type') || '';
     const body = type.includes('application/json') ? await response.json() : null;
@@ -128,6 +415,15 @@
       setInterval(refreshBootstrap, 12000);
       setInterval(loadSharedFiles, 12000);
       setInterval(() => { if (socket && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'ping' })); }, 20000);
+      setInterval(updatePerformanceDashboard, 1500);
+      updatePerformanceDashboard();
+      window.addEventListener('offline', () => {
+        for (const state of transfers.values()) if (!state.done) setTransferConnection(state, false, 'Wi-Fi connection lost · transfer paused');
+      });
+      window.addEventListener('online', () => {
+        for (const state of transfers.values()) if (!state.done) setTransferConnection(state, true, 'Network connection restored.');
+        if (!socket || socket.readyState === WebSocket.CLOSED) connectSocket();
+      });
     } catch (error) {
       byId('join-gate').classList.remove('hidden');
       byId('app-content').classList.add('hidden');
@@ -221,6 +517,15 @@
       setServerStatus(true, 'Connected to room');
       byId('peer-support').textContent = window.isSecureContext ? 'WebRTC direct · relay fallback' : 'Laptop relay · direct transfer may be blocked';
       socket.send(JSON.stringify({ type: 'join', device_id: deviceId, name: myName, device_type: myType }));
+      for (const state of transfers.values()) {
+        if (state.localCompletePending) reportTransferComplete(state, true);
+        if (!state.done) {
+          state.connectionPaused = false;
+          state.paused = !!state.manualPaused;
+          try { socket.send(JSON.stringify({ type: 'transfer_health', transfer_id: state.id, connected: true, reason: 'Room connection restored.' })); } catch (_) { }
+        }
+      }
+      renderTransfers();
       updateNoteSendButton();
     };
     socket.onmessage = (event) => {
@@ -229,6 +534,7 @@
     socket.onerror = () => setServerStatus(false, 'Connection interrupted');
     socket.onclose = () => {
       setServerStatus(false, 'Reconnecting…');
+      for (const state of transfers.values()) if (!state.done) setTransferConnection(state, false, 'Room connection interrupted. Transfer paused.');
       updateNoteSendButton();
       setTimeout(connectSocket, reconnectDelay);
       reconnectDelay = Math.min(15000, reconnectDelay * 1.7);
@@ -267,7 +573,11 @@
       const state = {
         id: message.transfer_id, direction: 'out', peerId: message.to,
         peerName: deviceName(message.to), files: outgoingSelection.slice(), status: 'Waiting for recipient approval',
-        progress: 0, incoming: false, created: Date.now(), verified: new Set(), hashes: []
+        progress: 0, loaded: 0, rateBps: 0, transport: 'Waiting', manualPaused: false, connectionPaused: false,
+        incoming: false, created: Date.now(), verified: new Set(), relayStreamCapable: false,
+        uploadedBytes: 0, downloadedBytes: 0, endToEndBytes: 0,
+        uploadRateBps: 0, downloadRateBps: 0, endToEndRateBps: 0, durationSeconds: 0,
+        directInbox: [], directWaiters: [], directFileIndex: 0, directSending: false
       };
       transfers.set(state.id, state);
       renderTransfers();
@@ -275,8 +585,13 @@
       const state = {
         id: message.transfer_id, direction: 'in', peerId: message.sender.id,
         peerName: message.sender.name, files: message.files || [], status: 'Waiting for your approval',
-        progress: 0, incoming: true, accepted: false, created: Date.now(), verified: new Set(),
-        candidates: [], remoteSet: false, receiveQueue: Promise.resolve()
+        progress: 0, loaded: 0, rateBps: 0, transport: 'Waiting', manualPaused: false, connectionPaused: false,
+        incoming: true, accepted: false, created: Date.now(), verified: new Set(),
+        diagnosticOutput: WEBRTC_DIAGNOSTICS_ENABLED ? WEBRTC_DIAGNOSTIC_OUTPUT : 'normal',
+        candidates: [], remoteSet: false, receiveQueue: Promise.resolve(), directInbox: [], directWaiters: [], relayParts: new Map(),
+        relayMode: 'disk', relayStreamCapable: false, relayDecisionPending: false, relayDecisionSubmitting: false,
+        uploadedBytes: 0, downloadedBytes: 0, endToEndBytes: 0,
+        uploadRateBps: 0, downloadRateBps: 0, endToEndRateBps: 0, durationSeconds: 0
       };
       transfers.set(state.id, state);
       renderTransfers();
@@ -290,35 +605,140 @@
         expireTransfer(state);
       } else {
         state.accepted = true;
-        state.status = 'Connecting directly…';
+        state.relayStreamCapable = !!message.relay_stream_capable;
+        if (!state.transferStarted) state.transferStarted = performance.now();
+        state.status = state.directStarted ? 'Reconnecting to recipient…' : 'Connecting directly…';
         renderTransfers();
-        startDirect(state);
+        if (state.channel && state.channel.readyState === 'open') sendDirect(state).catch((error) => handleDirectFailure(state, error));
+        else startDirect(state, !!state.directStarted || Number(state.directFileIndex || 0) > 0);
       }
     } else if (message.type === 'webrtc_signal') {
       handleSignal(message).catch((error) => {
         const state = transfers.get(message.transfer_id);
-        if (state) { state.status = 'Direct connection failed · using laptop relay'; renderTransfers(); }
+        if (state) setTransferConnection(state, false, 'Direct connection interrupted · waiting to reconnect');
       });
     } else if (message.type === 'relay_begin') {
       const state = transfers.get(message.transfer_id);
-      if (state) abortPartialReceive(state, true).then(() => { state.mode = 'relay'; state.status = 'Using the laptop relay…'; renderTransfers(); });
+      if (state) {
+        state.mode = 'relay'; state.transport = 'Laptop relay';
+        state.relayChunkSize = Number(message.chunk_size) || DEFAULT_RELAY_CHUNK_SIZE;
+        if (!state.manualPaused && socket && socket.readyState === WebSocket.OPEN) {
+          state.connectionPaused = false;
+          try { sendSocket({ type: 'transfer_health', transfer_id: state.id, connected: true, reason: 'Using the laptop relay.' }); } catch (_) { }
+        }
+        if (state.direction === 'in' && message.mode === 'automatic') {
+          state.relayMode = 'pending';
+          if (supportsLiveRelayFolder()) {
+            state.relayDecisionPending = true;
+            state.status = 'Choose a folder for Live Relay, or continue with Standard';
+            renderTransfers();
+          } else {
+            state.status = 'This browser uses Standard Relay';
+            renderTransfers();
+            submitRelayModeDecision(state, 'disk', false).catch((error) => failTransfer(state, error.message));
+          }
+        } else {
+          state.relayMode = message.mode === 'streaming' ? 'streaming' : 'disk';
+          state.relayDecisionPending = false;
+          if (state.relayMode === 'streaming' && !state.relayFilesReady) {
+            state.relayFilesReady = new Promise((resolve) => { state.resolveRelayFiles = resolve; });
+          }
+          state.status = state.manualPaused ? 'Paused by you' : state.relayMode === 'streaming' ? 'Live Relay · waiting for verified file' : 'Using Standard Relay…';
+          renderTransfers();
+          if (state.direction === 'in' && state.relayMode === 'streaming') receiveRelay(state, null, true).catch((error) => failTransfer(state, error.message));
+        }
+      }
+    } else if (message.type === 'relay_mode_selected') {
+      const state = transfers.get(message.transfer_id);
+      if (state) {
+        state.relayMode = message.mode === 'streaming' ? 'streaming' : 'disk';
+        state.relayStreamCapable = state.relayMode === 'streaming';
+        state.relayDecisionPending = false;
+        state.relayDecisionSubmitting = false;
+        if (state.direction === 'out') {
+          state.mode = 'fallbackstarting';
+          state.status = state.relayMode === 'streaming' ? 'Live Relay ready · uploading files' : 'Standard Relay ready · uploading files';
+          if (state.resolveRelayMode) { state.resolveRelayMode(state.relayMode); state.resolveRelayMode = null; }
+        } else if (state.relayMode === 'streaming') {
+          if (!state.relayFilesReady) state.relayFilesReady = new Promise((resolve) => { state.resolveRelayFiles = resolve; });
+          state.status = 'Live Relay · waiting for verified file';
+          receiveRelay(state, null, true).catch((error) => failTransfer(state, error.message));
+        } else {
+          state.status = 'Standard Relay · waiting for upload to finish';
+        }
+        renderTransfers();
+      }
     } else if (message.type === 'relay_ready') {
       const state = transfers.get(message.transfer_id);
-      if (state) receiveRelay(state, message.files || []).catch((error) => failTransfer(state, error.message));
+      if (state) {
+        state.relayFiles = message.files || [];
+        if (state.resolveRelayFiles) { state.resolveRelayFiles(state.relayFiles); state.resolveRelayFiles = null; }
+        (state.relayFiles || []).forEach((file, index) => resolveRelayFile(state, index, file));
+        if (state.relayMode !== 'streaming') receiveRelay(state, state.relayFiles).catch((error) => failTransfer(state, error.message));
+      }
+    } else if (message.type === 'relay_file_ready') {
+      const state = transfers.get(message.transfer_id);
+      if (state && Number.isInteger(Number(message.file_index)) && message.file) {
+        if (!state.relayFiles) state.relayFiles = [];
+        state.relayFiles[Number(message.file_index)] = message.file;
+        resolveRelayFile(state, Number(message.file_index), message.file);
+      }
     } else if (message.type === 'transfer_progress') {
       const state = transfers.get(message.transfer_id);
       if (state) {
         const total = state.files.reduce((sum, file) => sum + Number(file.size || 0), 0);
         state.progress = total ? Math.min(100, (Number(message.loaded || 0) / total) * 100) : 100;
-        state.status = (message.phase === 'relay-upload' ? 'Sending through laptop · ' : 'Transferring · ') + prettyBytes(message.loaded || 0) + ' of ' + prettyBytes(message.total || total) + ' · ' + measuredRate(message.loaded || 0, state.transferStarted);
+        state.loaded = Number(message.loaded || 0);
+        state.transport = displayTransport(message.transport || message.phase);
+        state.uploadRateBps = Number(message.upload_rate_bps || state.uploadRateBps || 0);
+        state.downloadRateBps = Number(message.download_rate_bps || state.downloadRateBps || 0);
+        state.endToEndRateBps = Number(message.end_to_end_rate_bps || state.endToEndRateBps || 0);
+        state.durationSeconds = Number(message.duration_seconds || state.durationSeconds || 0);
+        state.rateBps = state.endToEndRateBps || Number(message.rate_bps || state.rateBps || 0);
+        state.status = (message.phase === 'relay-upload' ? 'Sending to laptop relay' : message.phase === 'relay-download' ? 'Receiving from laptop relay' : 'Transferring') + ' · ' + prettyBytes(message.loaded || 0) + ' of ' + prettyBytes(message.total || total);
         renderTransfers();
+      }
+    } else if (message.type === 'transfer_control') {
+      const state = transfers.get(message.transfer_id);
+      if (state) {
+        state.manualPaused = message.action === 'pause';
+        state.connectionPaused = !!message.paused && !state.manualPaused;
+        state.paused = state.manualPaused || state.connectionPaused;
+        if (state.manualPaused) {
+          state.status = 'Paused by ' + (message.by === deviceId ? 'you' : state.peerName);
+          if (state.relayController) state.relayController.abort();
+        } else if (!state.connectionPaused) state.status = 'Resuming transfer…';
+        renderTransfers();
+        if (!state.manualPaused) resumeTransfer(state);
+      }
+    } else if (message.type === 'transfer_connection' || message.type === 'transfer_paused') {
+      const state = transfers.get(message.transfer_id);
+      if (state) {
+        if (message.type === 'transfer_connection') {
+          if (typeof message.manual_paused === 'boolean') state.manualPaused = message.manual_paused;
+          state.connectionPaused = !message.connected || (!!message.paused && !state.manualPaused);
+        }
+        else state.connectionPaused = true;
+        if (state.connectionPaused) {
+          state.status = message.reason || message.message || 'Connection interrupted · paused';
+          if (state.relayController) state.relayController.abort();
+        } else if (!state.manualPaused) state.status = 'Connection restored · resuming…';
+        renderTransfers();
+        if (!state.connectionPaused) resumeTransfer(state);
       }
     } else if (message.type === 'transfer_complete') {
       const state = transfers.get(message.transfer_id);
       if (state) {
-        state.status = message.ok ? 'Completed · integrity verified' : (message.message || 'Transfer failed');
+        if (state.resolveRelayMode) { state.resolveRelayMode('disk'); state.resolveRelayMode = null; }
+        state.durationSeconds = Number(message.duration_seconds || state.durationSeconds || 0);
+        state.status = message.ok ? 'Completed · integrity verified · ' + prettyDuration(state.durationSeconds) : (message.message || 'Transfer failed');
         state.progress = message.ok ? 100 : state.progress;
+        state.uploadRateBps = Number(message.upload_rate_bps || state.uploadRateBps || 0);
+        state.downloadRateBps = Number(message.download_rate_bps || state.downloadRateBps || 0);
+        state.endToEndRateBps = Number(message.end_to_end_rate_bps || state.endToEndRateBps || 0);
+        state.durationSeconds = Number(message.duration_seconds || state.durationSeconds || 0);
         state.done = true;
+        if (!message.ok && state.relayController) state.relayController.abort();
         closePeer(state);
         renderTransfers();
         expireTransfer(state);
@@ -572,11 +992,32 @@
       const icon = makeText('span', 'transfer-icon', item.direction === 'in' ? '↓' : '↑');
       const main = document.createElement('div'); main.className = 'transfer-main';
       const title = makeText('strong', '', (item.direction === 'in' ? item.peerName + ' is sending' : 'Sending to ' + item.peerName));
-      const summary = item.files.map((file) => file.name).join(', ');
+      const visibleNames = item.files.slice(0, 2).map((file) => file.name);
+      const summary = visibleNames.join(', ') + (item.files.length > 2 ? ' +' + (item.files.length - 2) + ' more' : '');
       const sub = makeText('small', '', item.files.length + ' file' + (item.files.length === 1 ? '' : 's') + ' · ' + summary);
       main.append(title, sub);
       const status = makeText('div', 'transfer-status', item.status);
-      row.append(icon, main, status);
+      const details = document.createElement('div'); details.className = 'transfer-summary';
+      const total = item.files.reduce((sum, file) => sum + Number(file.size || 0), 0);
+      const loaded = Math.min(total, Number(item.endToEndBytes ?? (item.loaded || total * (item.progress || 0) / 100)));
+      const rate = item.manualPaused || item.connectionPaused ? 0 : Number(item.endToEndRateBps || (item.mode === 'direct' ? item.rateBps : 0) || 0);
+      const paused = item.manualPaused || item.connectionPaused;
+      const remaining = rate > 0 ? Math.max(0, total - loaded) / rate : 0;
+      const eta = rate > 0 ? ' · ' + (remaining >= 3600 ? Math.ceil(remaining / 3600) + 'h left' : remaining >= 60 ? Math.ceil(remaining / 60) + 'm left' : Math.ceil(remaining) + 's left') : '';
+      const transport = item.transport || (item.mode === 'direct' ? 'Direct WebRTC' : item.mode === 'fallback' ? 'Laptop relay' : 'Connecting');
+      const stageRates = transport === 'Laptop relay' ? ' · Up ' + prettyRate(item.uploadRateBps || 0) + ' · Down ' + prettyRate(item.downloadRateBps || 0) : '';
+      const metrics = makeText('small', 'transfer-metrics', transport + ' · ' + prettyBytes(loaded) + ' / ' + prettyBytes(total) + ' · ' + (paused ? 'paused' : rate ? 'End-to-end ' + prettyRate(rate) : 'measuring recipient speed') + eta + stageRates);
+      details.append(icon, main, status, metrics);
+      row.append(details);
+      if (item.incoming && item.relayDecisionPending && !item.done) {
+        const relayActions = document.createElement('div'); relayActions.className = 'transfer-actions relay-choice-actions';
+        const liveRelay = makeText('button', 'button primary compact', item.relayDecisionSubmitting ? 'Preparing…' : 'Choose folder for Live Relay');
+        const standardRelay = makeText('button', 'button secondary compact', 'Use Standard');
+        liveRelay.disabled = standardRelay.disabled = !!item.relayDecisionSubmitting;
+        liveRelay.addEventListener('click', () => chooseLiveRelayFolder(item));
+        standardRelay.addEventListener('click', () => submitRelayModeDecision(item, 'disk', false).catch((error) => failTransfer(item, error.message)));
+        relayActions.append(liveRelay, standardRelay); row.append(relayActions);
+      }
       if (item.incoming && !item.accepted && !item.done) {
         const actions = document.createElement('div'); actions.className = 'transfer-actions';
         const accept = makeText('button', 'button primary compact', 'Accept');
@@ -589,10 +1030,189 @@
         const fill = document.createElement('span'); fill.style.width = Math.max(2, item.progress || 0) + '%'; track.append(fill); row.append(track);
         const cancel = makeText('button', 'button secondary compact', 'Cancel');
         cancel.addEventListener('click', () => cancelTransfer(item));
-        const actions = document.createElement('div'); actions.className = 'transfer-actions'; actions.append(cancel); row.append(actions);
+        const actions = document.createElement('div'); actions.className = 'transfer-actions transfer-control-buttons';
+        if (item.accepted || item.mode) {
+          const isPaused = item.manualPaused || item.connectionPaused;
+          const pause = makeText('button', 'button secondary compact', isPaused ? 'Resume' : 'Pause');
+          pause.setAttribute('aria-label', isPaused ? 'Resume transfer' : 'Pause transfer');
+          pause.addEventListener('click', () => toggleTransferPause(item));
+          actions.append(pause);
+        }
+        actions.append(cancel); row.append(actions);
       }
       host.append(row);
     }
+    renderPerformanceDashboard();
+  }
+
+  function renderPerformanceDashboard() {
+    if (!byId('performance-active')) return;
+    const active = Array.from(transfers.values()).filter((item) => !item.done);
+    const speed = active.reduce((sum, item) => sum + (item.manualPaused || item.connectionPaused ? 0 : Number(item.endToEndRateBps || 0)), 0);
+    const uploadSpeed = active.reduce((sum, item) => sum + (item.manualPaused || item.connectionPaused ? 0 : Number(item.uploadRateBps || 0)), 0);
+    const downloadSpeed = active.reduce((sum, item) => sum + (item.manualPaused || item.connectionPaused ? 0 : Number(item.downloadRateBps || 0)), 0);
+    const moved = active.reduce((sum, item) => sum + Number(item.endToEndBytes || 0), 0);
+    const duration = active.reduce((max, item) => Math.max(max, Number(item.durationSeconds || 0)), 0);
+    byId('performance-active').textContent = String(active.length);
+    byId('performance-speed').textContent = prettyRate(speed);
+    byId('performance-data').textContent = prettyBytes(moved);
+    byId('performance-upload').textContent = prettyRate(uploadSpeed);
+    byId('performance-download').textContent = prettyRate(downloadSpeed);
+    byId('performance-duration').textContent = prettyDuration(duration);
+    byId('performance-connection').textContent = socket && socket.readyState === WebSocket.OPEN ? 'Room online' : 'Reconnecting…';
+    const cpu = performanceSnapshot && performanceSnapshot.host_cpu_percent;
+    const memory = performanceSnapshot && performanceSnapshot.host_memory_bytes;
+    byId('performance-host-load').textContent = cpu == null || memory == null ? '—' : Number(cpu).toFixed(0) + '% · ' + prettyBytes(memory);
+    const routes = new Map();
+    for (const item of active) {
+      const route = item.transport || 'Connecting';
+      routes.set(route, (routes.get(route) || 0) + 1);
+    }
+    const routeText = routes.size ? Array.from(routes, ([name, count]) => count + ' ' + name).join(' · ') : 'No active transfer route';
+    const paused = active.filter((item) => item.manualPaused || item.connectionPaused).length;
+    const offline = !socket || socket.readyState !== WebSocket.OPEN;
+    byId('performance-hint').textContent = routeText + (paused ? ' · ' + paused + ' paused; progress resumes from the last confirmed block.' : ' · Each transfer shows progress, speed, route, and estimated time remaining.');
+    const live = byId('performance-live');
+    live.classList.toggle('is-paused', paused > 0 || offline);
+    live.lastChild.textContent = paused ? ' Paused' : offline ? ' Reconnecting' : ' Live';
+  }
+
+  async function updatePerformanceDashboard() {
+    renderPerformanceDashboard();
+    if (!access || !socket || socket.readyState !== WebSocket.OPEN) return;
+    try {
+      performanceSnapshot = await api('/api/transfers/performance');
+      for (const item of performanceSnapshot.active_transfers || []) {
+        const state = transfers.get(item.id);
+        if (!state) continue;
+        state.endToEndBytes = Number(item.end_to_end_bytes || 0);
+        state.uploadedBytes = Number(item.uploaded_bytes || 0);
+        state.downloadedBytes = Number(item.downloaded_bytes || 0);
+        state.uploadRateBps = Number(item.upload_rate_bps || 0);
+        state.downloadRateBps = Number(item.download_rate_bps || 0);
+        state.endToEndRateBps = Number(item.end_to_end_rate_bps || 0);
+        state.durationSeconds = Number(item.duration_seconds || 0);
+        state.loaded = Number(item.end_to_end_bytes || 0);
+        const transferTotal = Number(item.total || 0);
+        state.progress = transferTotal ? state.loaded / transferTotal * 100 : 0;
+        state.rateBps = state.endToEndRateBps;
+        if (item.transport && (!state.transport || state.transport === 'Waiting')) state.transport = displayTransport(item.transport);
+      }
+      renderPerformanceDashboard();
+    } catch (_) { /* Local transfer measurements remain visible during a short outage. */ }
+  }
+
+  function toggleTransferPause(state) {
+    const action = state.manualPaused || state.connectionPaused ? 'resume' : 'pause';
+    state.manualPaused = action === 'pause';
+    state.paused = state.manualPaused || state.connectionPaused;
+    state.status = state.manualPaused ? 'Paused by you' : (state.connectionPaused ? 'Waiting for connection…' : 'Resuming transfer…');
+    if (state.manualPaused && state.relayController) state.relayController.abort();
+    try { sendSocket({ type: 'transfer_control', transfer_id: state.id, action }); }
+    catch (error) { if (action === 'pause') toast(error.message, 'error'); }
+    renderTransfers();
+    if (action === 'resume') resumeTransfer(state);
+  }
+
+  function setTransferConnection(state, connected, reason) {
+    if (connected) { clearTimeout(state.reconnectTimer); state.reconnectTimer = null; }
+    state.connectionPaused = !connected;
+    state.paused = state.manualPaused || state.connectionPaused;
+    if (!connected) {
+      state.status = reason || 'Connection interrupted · paused';
+      if (state.relayController) state.relayController.abort();
+    } else if (!state.manualPaused) state.status = 'Connection restored · resuming…';
+    try { sendSocket({ type: 'transfer_health', transfer_id: state.id, connected, reason }); } catch (_) { }
+    renderTransfers();
+    if (connected) resumeTransfer(state);
+  }
+
+  function resumeTransfer(state) {
+    if (!state || state.done || state.manualPaused) return;
+    if (state.connectionPaused) {
+      if (state.direction === 'out' && state.mode === 'direct' && (!state.pc || state.pc.connectionState !== 'connected' || !state.channel || state.channel.readyState !== 'open')) scheduleDirectReconnect(state);
+      return;
+    }
+    if (state.direction === 'out' && state.accepted) {
+      if (state.mode === 'fallback' || state.mode === 'fallbackstarting') fallbackRelay(state).catch(() => { });
+      else if (state.channel && state.channel.readyState === 'open') sendDirect(state).catch((error) => handleDirectFailure(state, error));
+      else startDirect(state, !!state.directStarted || Number(state.directFileIndex || 0) > 0).catch(() => { });
+    } else if (state.direction === 'in' && state.mode === 'fallback' && (state.relayFiles || state.relayMode === 'streaming')) {
+      receiveRelay(state, state.relayFiles, state.relayMode === 'streaming').catch((error) => failTransfer(state, error.message));
+    }
+  }
+
+  function waitUntilTransferCanFlow(state) {
+    if (state.done) return Promise.reject(new Error('Transfer cancelled.'));
+    if (!state.manualPaused && !state.connectionPaused && socket && socket.readyState === WebSocket.OPEN) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const timer = setInterval(() => {
+        if (state.done) { clearInterval(timer); reject(new Error('Transfer cancelled.')); }
+        else if (!state.manualPaused && !state.connectionPaused && socket && socket.readyState === WebSocket.OPEN) { clearInterval(timer); resolve(); }
+      }, 250);
+    });
+  }
+
+  async function sendTransferSocket(state, message) {
+    while (!state.done) {
+      await waitUntilTransferCanFlow(state);
+      try { sendSocket(message); return; }
+      catch (_) { state.status = 'Room reconnecting · transfer will continue'; renderTransfers(); await sleep(250); }
+    }
+    throw new Error('Transfer cancelled.');
+  }
+
+  function waitDirectResponse(state, type, index, offset) {
+    const match = (item) => item.type === type && item.index === index && (offset === undefined || item.offset === offset || (item.complete && item.offset >= offset));
+    const buffered = state.directInbox.findIndex(match);
+    if (buffered >= 0) return Promise.resolve(state.directInbox.splice(buffered, 1)[0]);
+    return new Promise((resolve, reject) => {
+      const waiter = { type, index, offset, resolve, reject, timer: null };
+      waiter.timer = setTimeout(() => {
+        const position = state.directWaiters.indexOf(waiter);
+        if (position >= 0) state.directWaiters.splice(position, 1);
+        reject(new Error('No confirmation arrived · reconnecting from the last saved block.'));
+      }, 30000);
+      state.directWaiters.push(waiter);
+    });
+  }
+
+  function receiveDirectResponse(state, item) {
+    if (item.type === 'file_ack' && !item.complete && state.webrtcDiagnostics) {
+      const ackKey = item.index + ':' + item.offset;
+      const sentAt = state.webrtcDiagnostics.pendingAckTimes.get(ackKey);
+      if (sentAt != null) {
+        diagnosticAdd(state, 'dataChannelAckRoundTrip', performance.now() - sentAt);
+        state.webrtcDiagnostics.pendingAckTimes.delete(ackKey);
+        state.webrtcDiagnostics.timing.ackResponses = (state.webrtcDiagnostics.timing.ackResponses || 0) + 1;
+      }
+    }
+    if (item.type === 'file_ack' && state.direction === 'out') {
+      const prior = state.files.slice(0, item.index).reduce((sum, file) => sum + Number(file.size || 0), 0);
+      state.loaded = prior + Number(item.offset || 0);
+      const total = state.files.reduce((sum, file) => sum + Number(file.size || 0), 0);
+      state.progress = total ? state.loaded / total * 100 : 100;
+      updateTransferRate(state, state.loaded);
+      state.endToEndBytes = state.loaded;
+      if (state.mode === 'direct') state.endToEndRateBps = state.rateBps;
+      state.status = item.complete ? 'File verified · continuing transfer' : 'Transferring · ' + prettyBytes(state.loaded) + ' of ' + prettyBytes(total);
+      try { sendSocket({ type: 'transfer_progress', transfer_id: state.id, loaded: state.loaded, total, phase: 'direct', file_index: item.index }); } catch (_) { }
+      renderTransferProgress(state, item.complete || item.offset % DIRECT_CHECKPOINT_SIZE === 0);
+    }
+    if (item.type === 'file_ack') {
+      state.directInbox = state.directInbox.filter((saved) => saved.type !== 'file_ack' || saved.index !== item.index || saved.offset > item.offset);
+    }
+    const index = state.directWaiters.findIndex((waiter) => waiter.type === item.type && waiter.index === item.index && (waiter.offset === undefined || item.offset === waiter.offset || (item.complete && item.offset >= waiter.offset)));
+    if (index < 0) state.directInbox.push(item);
+    else {
+      const waiter = state.directWaiters.splice(index, 1)[0];
+      clearTimeout(waiter.timer); waiter.resolve(item);
+    }
+  }
+
+  function rejectDirectWaiters(state, message) {
+    for (const waiter of state.directWaiters || []) { clearTimeout(waiter.timer); waiter.reject(new Error(message || 'Direct connection interrupted.')); }
+    state.directWaiters = [];
   }
 
   async function requestSend() {
@@ -606,15 +1226,82 @@
   }
 
   async function acceptIncoming(state) {
-    state.accepted = true;
-    state.status = 'Accepted · preparing connection';
-    if (window.showDirectoryPicker && window.isSecureContext) {
-      try { state.directory = await window.showDirectoryPicker({ mode: 'readwrite' }); }
-      catch (error) { if (error.name !== 'AbortError') toast('Could not open the destination folder. Files will use browser downloads.', 'error'); }
+    if (WEBRTC_DIAGNOSTICS_ENABLED && state.diagnosticOutput === 'file') {
+      if (!supportsLiveRelayFolder()) {
+        toast('File-write diagnostics need a secure browser connection with folder access. Use memory mode on this browser.', 'error');
+        return;
+      }
+      try {
+        const directory = await window.showDirectoryPicker({ mode: 'readwrite' });
+        if (typeof directory.queryPermission === 'function') {
+          let permission = await directory.queryPermission({ mode: 'readwrite' });
+          if (permission !== 'granted' && typeof directory.requestPermission === 'function') permission = await directory.requestPermission({ mode: 'readwrite' });
+          if (permission !== 'granted') throw new DOMException('Write access was not granted.', 'NotAllowedError');
+        }
+        state.directory = directory;
+      } catch (error) {
+        if (error.name !== 'AbortError') toast('Could not open the diagnostic output folder: ' + error.message, 'error');
+        return;
+      }
     }
-    try { sendSocket({ type: 'transfer_decision', transfer_id: state.id, accepted: true }); }
+    state.accepted = true;
+    if (!state.transferStarted) state.transferStarted = performance.now();
+    state.status = 'Accepted · preparing connection';
+    state.relayStreamCapable = false;
+    try { sendSocket({ type: 'transfer_decision', transfer_id: state.id, accepted: true, relay_stream_capable: state.relayStreamCapable }); }
     catch (error) { state.status = error.message; }
     renderTransfers();
+  }
+
+  function supportsLiveRelayFolder() {
+    const fileHandle = window.FileSystemFileHandle;
+    const directoryHandle = window.FileSystemDirectoryHandle;
+    return !!(
+      window.isSecureContext && typeof window.showDirectoryPicker === 'function' &&
+      fileHandle && fileHandle.prototype && typeof fileHandle.prototype.createWritable === 'function' &&
+      directoryHandle && directoryHandle.prototype && typeof directoryHandle.prototype.getFileHandle === 'function'
+    );
+  }
+
+  async function chooseLiveRelayFolder(state) {
+    if (!state || state.done || state.relayDecisionSubmitting) return;
+    try {
+      const directory = await window.showDirectoryPicker({ mode: 'readwrite' });
+      if (typeof directory.queryPermission === 'function') {
+        let permission = await directory.queryPermission({ mode: 'readwrite' });
+        if (permission !== 'granted' && typeof directory.requestPermission === 'function') {
+          permission = await directory.requestPermission({ mode: 'readwrite' });
+        }
+        if (permission !== 'granted') throw new DOMException('Write access was not granted.', 'NotAllowedError');
+      }
+      if (!directory || typeof directory.getFileHandle !== 'function') throw new Error('Folder access is not supported by this browser.');
+      state.directory = directory;
+      state.relayStreamCapable = true;
+      await submitRelayModeDecision(state, 'streaming', true);
+    } catch (error) {
+      state.directory = null;
+      state.relayStreamCapable = false;
+      if (error.name !== 'AbortError') toast('Folder access was unavailable. Continuing with Standard Relay.', 'error');
+      await submitRelayModeDecision(state, 'disk', false).catch((decisionError) => failTransfer(state, decisionError.message));
+    }
+  }
+
+  async function submitRelayModeDecision(state, mode, capable) {
+    if (!state || state.done || state.relayDecisionSubmitting) return;
+    state.relayDecisionSubmitting = true;
+    state.status = mode === 'streaming' ? 'Preparing Live Relay…' : 'Switching to Standard Relay…';
+    renderTransfers();
+    try {
+      await sendTransferSocket(state, {
+        type: 'relay_mode_decision', transfer_id: state.id,
+        mode, capable: !!capable,
+      });
+    } finally {
+      if (!state.done && state.relayDecisionPending) {
+        state.relayDecisionSubmitting = false;
+        renderTransfers();
+      }
+    }
   }
 
   function rejectIncoming(state) {
@@ -631,16 +1318,38 @@
   }
 
   function setupPeer(state, sender) {
+    const oldChannel = state.channel; state.channel = null;
+    const oldPc = state.pc; state.pc = null;
+    rejectDirectWaiters(state, 'Direct connection is restarting.');
+    if (oldChannel) { try { oldChannel.close(); } catch (_) { } }
+    if (oldPc) { try { oldPc.close(); } catch (_) { } }
+    if (state.webrtcStatsTimer) { clearInterval(state.webrtcStatsTimer); state.webrtcStatsTimer = null; }
     const pc = new RTCPeerConnection(rtcConfig());
     state.pc = pc;
+    startWebRtcDiagnostics(state, pc);
     pc.onicecandidate = (event) => {
       if (event.candidate) {
         try { sendSocket({ type: 'webrtc_signal', to: state.peerId, transfer_id: state.id, signal: { type: 'candidate', candidate: event.candidate } }); } catch (_) { }
       }
     };
     pc.onconnectionstatechange = () => {
-      if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-        if (sender && !state.directDone) fallbackRelay(state).catch((error) => failTransfer(state, error.message));
+      if (state.pc !== pc || state.done || state.mode === 'fallback' || state.mode === 'fallbackstarting' || state.mode === 'relay') return;
+      if (pc.connectionState === 'connected') {
+        clearTimeout(state.reconnectTimer); state.reconnectTimer = null; state.reconnectAttempts = 0;
+        state.transport = 'Direct WebRTC';
+        state.mode = 'direct';
+        if (state.connectionPaused) setTransferConnection(state, true, 'Direct connection restored.');
+        else renderTransfers();
+      } else if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+        setTransferConnection(state, false, 'Connection interrupted · transfer paused while reconnecting');
+        if (sender && state.directStarted && pc.connectionState !== 'disconnected') scheduleDirectReconnect(state);
+        if (sender && pc.connectionState === 'disconnected') {
+          clearTimeout(state.reconnectTimer);
+          state.reconnectTimer = setTimeout(() => {
+            state.reconnectTimer = null;
+            if (state.pc === pc && (pc.connectionState === 'disconnected' || pc.connectionState === 'failed')) scheduleDirectReconnect(state);
+          }, 3500);
+        }
       }
     };
     pc.ondatachannel = (event) => attachChannel(state, event.channel);
@@ -656,33 +1365,76 @@
     channel.binaryType = 'arraybuffer';
     channel.bufferedAmountLowThreshold = 512 * 1024;
     channel.onopen = () => {
-      if (state.direction === 'out' && !state.startedDirect) {
-        state.startedDirect = true;
-        state.mode = 'direct';
-        sendDirect(state).catch((error) => fallbackRelay(state, error));
-      }
+      if (state.done) return;
+      state.mode = 'direct'; state.transport = 'Direct WebRTC';
+      if (state.connectionPaused) setTransferConnection(state, true, 'Direct connection restored.');
+      if (state.direction === 'out') sendDirect(state).catch((error) => handleDirectFailure(state, error));
+      else { state.status = 'Direct connection ready'; renderTransfers(); }
     };
     channel.onmessage = (event) => {
-      if (state.receiveQueue) state.receiveQueue = state.receiveQueue.then(() => receiveMessage(state, event.data)).catch((error) => failTransfer(state, error.message));
+      if (state.channel !== channel) return;
+      if (state.receiveQueue && WEBRTC_DIAGNOSTICS_ENABLED) {
+        const queuedAt = performance.now();
+        state.receiveQueue = state.receiveQueue.then(async () => {
+          const processingStarted = performance.now();
+          diagnosticAdd(state, 'receiveQueueWait', processingStarted - queuedAt);
+          try { await receiveMessage(state, event.data); }
+          finally { diagnosticAdd(state, 'receiveQueueProcessingWall', performance.now() - processingStarted); }
+        }).catch((error) => { if (!state.done) failTransfer(state, error.message); });
+      } else if (state.receiveQueue) state.receiveQueue = state.receiveQueue.then(() => receiveMessage(state, event.data)).catch((error) => { if (!state.done) failTransfer(state, error.message); });
+      else receiveMessage(state, event.data).catch((error) => { if (!state.done) handleDirectFailure(state, error); });
     };
-    channel.onerror = () => {
-      if (state.direction === 'out' && !state.directDone) fallbackRelay(state).catch((error) => failTransfer(state, error.message));
-    };
+    channel.onerror = () => { if (state.channel !== channel) return; rejectDirectWaiters(state, 'Direct connection interrupted.'); if (state.direction === 'out') handleDirectFailure(state, new Error('Direct connection interrupted.')); };
+    channel.onclose = () => { if (state.channel !== channel) return; rejectDirectWaiters(state, 'Direct connection interrupted.'); if (state.direction === 'out' && !state.done) handleDirectFailure(state, new Error('Direct connection interrupted.')); };
   }
 
-  async function startDirect(state) {
-    if (state.mode === 'fallback' || state.mode === 'fallbackstarting') return;
+  async function startDirect(state, reconnect = false) {
+    if (!state || state.done || state.manualPaused || state.connectionPaused || state.mode === 'fallback' || state.mode === 'fallbackstarting' || state.directAttempt) return;
     if (!window.RTCPeerConnection) { await fallbackRelay(state); return; }
+    state.directAttempt = true;
     try {
       setupPeer(state, true);
       const offer = await state.pc.createOffer();
       await state.pc.setLocalDescription(offer);
       sendSocket({ type: 'webrtc_signal', to: state.peerId, transfer_id: state.id, signal: { type: 'description', description: JSON.parse(JSON.stringify(state.pc.localDescription)) } });
-      state.status = 'Connecting directly…'; renderTransfers();
-      await waitForChannel(state.channel, state, 14000);
+      state.status = reconnect ? 'Reconnecting · transfer paused safely…' : 'Connecting directly…'; state.transport = 'Direct WebRTC'; renderTransfers();
+      await waitForChannel(state.channel, state, reconnect ? 10000 : 6000);
     } catch (error) {
-      await fallbackRelay(state, error);
+      if (!state.directStarted && !reconnect) await fallbackRelay(state, error);
+      else scheduleDirectReconnect(state);
+    } finally { state.directAttempt = false; }
     }
+
+  function scheduleDirectReconnect(state) {
+    if (!state || state.done || state.manualPaused || state.reconnectTimer || state.mode === 'fallback' || state.mode === 'fallbackstarting') return;
+    state.connectionPaused = true; state.paused = true;
+    const delay = Math.min(10000, 1000 * Math.pow(1.6, Math.min(state.reconnectAttempts || 0, 5)));
+    state.reconnectAttempts = (state.reconnectAttempts || 0) + 1;
+    state.status = 'Connection interrupted · retrying in ' + Math.ceil(delay / 1000) + 's';
+    renderTransfers();
+    state.reconnectTimer = setTimeout(() => {
+      state.reconnectTimer = null;
+      if (!state.done && !state.manualPaused && socket && socket.readyState === WebSocket.OPEN) {
+        const pathRecovered = state.pc && state.pc.connectionState === 'connected' && state.channel && state.channel.readyState === 'open';
+        if (pathRecovered && !state.forceReconnect) {
+          state.connectionPaused = false; state.paused = false; state.reconnectAttempts = 0;
+          state.status = 'Connection restored · resuming transfer';
+          renderTransfers(); resumeTransfer(state); return;
+        }
+        state.forceReconnect = false;
+        state.connectionPaused = false;
+        startDirect(state, true).catch(() => scheduleDirectReconnect(state));
+      } else if (!state.done) scheduleDirectReconnect(state);
+    }, delay);
+  }
+
+  function handleDirectFailure(state, error) {
+    if (!state || state.done || state.manualPaused) return;
+    rejectDirectWaiters(state, error && error.message);
+    state.forceReconnect = true;
+    setTransferConnection(state, false, 'Connection interrupted · resuming from last confirmed block');
+    if (!state.directStarted) fallbackRelay(state, error).catch(() => { });
+    else scheduleDirectReconnect(state);
   }
 
   function waitForChannel(channel, state, timeoutMs) {
@@ -705,7 +1457,10 @@
     const signal = message.signal || {};
     if (signal.type === 'description' && signal.description && signal.description.type === 'offer') {
       if (!window.RTCPeerConnection) return;
-      if (!state.pc) setupPeer(state, false);
+      if (!state.pc || state.pc.connectionState === 'failed' || state.pc.connectionState === 'closed' || state.pc.connectionState === 'disconnected' || state.lastOffer !== signal.description.sdp) {
+        setupPeer(state, false); state.remoteSet = false; state.candidates = [];
+        state.lastOffer = signal.description.sdp;
+      }
       await state.pc.setRemoteDescription(signal.description);
       state.remoteSet = true;
       for (const candidate of state.candidates.splice(0)) await state.pc.addIceCandidate(candidate);
@@ -725,201 +1480,517 @@
   }
 
   async function sendDirect(state) {
+    if (state.directSending || state.done || state.manualPaused || state.connectionPaused) return;
     const channel = state.channel;
     if (!channel || channel.readyState !== 'open') throw new Error('Direct connection is unavailable.');
+    state.directSending = true; state.directStarted = true;
     const totalSize = state.files.reduce((sum, file) => sum + file.size, 0);
-    let sentTotal = 0;
-    for (let index = 0; index < state.files.length; index++) {
-      const file = state.files[index];
-      state.status = 'Checking file integrity · ' + file.name; renderTransfers();
-      const digest = await hashFile(file);
-      state.hashes[index] = digest;
-      if (!state.transferStarted) state.transferStarted = performance.now();
-      channel.send(JSON.stringify({ type: 'file_start', index, name: safeFileName(file.name), size: file.size, sha256: digest }));
-      const chunkSize = 64 * 1024;
-      for (let offset = 0; offset < file.size; offset += chunkSize) {
-        await waitForCapacity(channel);
-        const buffer = await file.slice(offset, Math.min(file.size, offset + chunkSize)).arrayBuffer();
-        channel.send(buffer);
-        sentTotal += buffer.byteLength;
-        state.progress = totalSize ? (sentTotal / totalSize) * 100 : 100;
-        if (offset === 0 || offset + chunkSize >= file.size || offset % (chunkSize * 20) === 0) {
-          try { sendSocket({ type: 'transfer_progress', transfer_id: state.id, loaded: sentTotal, total: totalSize, phase: 'direct' }); } catch (_) { }
+    let loadedBefore = 0;
+    try {
+      for (let index = 0; index < state.files.length; index++) {
+        const file = state.files[index];
+        if (index < state.directFileIndex) { loadedBefore += file.size; continue; }
+        await waitUntilTransferCanFlow(state);
+        if (!state.transferStarted) state.transferStarted = performance.now();
+        const readyPromise = waitDirectResponse(state, 'resume_ready', index);
+        if (channel.readyState !== 'open') throw new Error('Direct connection interrupted.');
+        state.status = 'Starting · ' + file.name; renderTransfers();
+        channel.send(JSON.stringify({ type: 'file_start', index, name: safeFileName(file.name), size: file.size }));
+        const ready = await readyPromise;
+        if (ready.complete) {
+          loadedBefore += file.size; state.loaded = loadedBefore; state.directFileIndex = index + 1;
+          state.progress = totalSize ? state.loaded / totalSize * 100 : 100;
+          continue;
+        }
+        let offset = Math.max(0, Math.min(file.size, Number(ready.offset || 0)));
+        state.loaded = loadedBefore + offset;
+        while (offset < file.size) {
+          await waitUntilTransferCanFlow(state);
+          if (!state.channel || state.channel.readyState !== 'open') throw new Error('Direct connection interrupted.');
+          const batchEnd = Math.min(file.size, offset + DIRECT_ACK_WINDOW_SIZE);
+          const ackPromise = waitDirectResponse(state, 'file_ack', index, batchEnd);
+          while (offset < batchEnd) {
+            const blockEnd = Math.min(batchEnd, offset + DIRECT_CHECKPOINT_SIZE);
+            const readStarted = WEBRTC_DIAGNOSTICS_ENABLED ? performance.now() : 0;
+            const block = new Uint8Array(await file.slice(offset, blockEnd).arrayBuffer());
+            if (WEBRTC_DIAGNOSTICS_ENABLED) diagnosticAdd(state, 'fileRead', performance.now() - readStarted);
+            const crcStarted = WEBRTC_DIAGNOSTICS_ENABLED ? performance.now() : 0;
+            const blockCrc = crc32Hex(block);
+            if (WEBRTC_DIAGNOSTICS_ENABLED) diagnosticAdd(state, 'senderCrc32', performance.now() - crcStarted);
+            const blockMessage = {
+              type: 'file_block', index, offset, size: block.byteLength,
+              crc32: blockCrc,
+            };
+            state.channel.send(JSON.stringify(blockMessage));
+            for (let position = 0; position < block.byteLength; position += DIRECT_CHUNK_SIZE) {
+              await waitForCapacity(state.channel, state);
+              const part = block.subarray(position, Math.min(block.byteLength, position + DIRECT_CHUNK_SIZE));
+              if (state.webrtcDiagnostics && position + part.byteLength === block.byteLength) {
+                state.webrtcDiagnostics.pendingAckTimes.set(index + ':' + blockEnd, performance.now());
+              }
+              const sendStarted = WEBRTC_DIAGNOSTICS_ENABLED ? performance.now() : 0;
+              state.channel.send(part);
+              if (WEBRTC_DIAGNOSTICS_ENABLED) diagnosticAdd(state, 'dataChannelSendCall', performance.now() - sendStarted);
+              if (state.webrtcDiagnostics) state.webrtcDiagnostics.peakBufferedAmount = Math.max(state.webrtcDiagnostics.peakBufferedAmount, state.channel.bufferedAmount || 0);
+            }
+            offset = blockEnd;
+          }
+          const ackStarted = WEBRTC_DIAGNOSTICS_ENABLED ? performance.now() : 0;
+          await ackPromise;
+          if (WEBRTC_DIAGNOSTICS_ENABLED) diagnosticAdd(state, 'senderAckWait', performance.now() - ackStarted);
+          if (state.webrtcDiagnostics) state.webrtcDiagnostics.timing.ackWindows = (state.webrtcDiagnostics.timing.ackWindows || 0) + 1;
+          state.loaded = loadedBefore + offset;
+          state.progress = totalSize ? state.loaded / totalSize * 100 : 100;
+          state.status = 'Transferring · ' + prettyBytes(state.loaded) + ' of ' + prettyBytes(totalSize);
+          updateTransferRate(state, state.loaded);
+          try { sendSocket({ type: 'transfer_progress', transfer_id: state.id, loaded: state.loaded, total: totalSize, phase: 'direct', file_index: index }); } catch (_) { }
           renderTransfers();
         }
+        if (state.channel.readyState !== 'open') throw new Error('Direct connection interrupted.');
+        const completePromise = waitDirectResponse(state, 'file_ack', index, file.size);
+        state.channel.send(JSON.stringify({ type: 'file_end', index }));
+        const completeAck = await completePromise;
+        if (!completeAck.complete) throw new Error('Recipient did not confirm the completed file.');
+        loadedBefore += file.size; state.loaded = loadedBefore; state.directFileIndex = index + 1;
+        state.progress = totalSize ? state.loaded / totalSize * 100 : 100;
+        try { sendSocket({ type: 'transfer_progress', transfer_id: state.id, loaded: state.loaded, total: totalSize, phase: 'direct', file_index: index }); } catch (_) { }
       }
-      channel.send(JSON.stringify({ type: 'file_end', index }));
-    }
-    channel.send(JSON.stringify({ type: 'all_done' }));
-    state.status = 'Sent · waiting for recipient integrity check';
-    state.progress = 100;
-    renderTransfers();
+      if (state.channel.readyState !== 'open') throw new Error('Direct connection interrupted.');
+      state.channel.send(JSON.stringify({ type: 'all_done' }));
+      state.durationSeconds = state.transferStarted ? (performance.now() - state.transferStarted) / 1000 : state.durationSeconds;
+      state.status = 'Sent · recipient verified all files · ' + prettyDuration(state.durationSeconds); state.progress = 100; state.loaded = totalSize;
+      renderTransfers();
+    } finally { state.directSending = false; }
   }
 
-  function waitForCapacity(channel) {
-    if (channel.bufferedAmount < 2 * 1024 * 1024) return Promise.resolve();
-    return new Promise((resolve) => {
-      channel.addEventListener('bufferedamountlow', resolve, { once: true });
-      setTimeout(resolve, 300);
+  async function waitForCapacity(channel, state) {
+    const waitStarted = WEBRTC_DIAGNOSTICS_ENABLED ? performance.now() : 0;
+    await waitUntilTransferCanFlow(state);
+    if (channel.readyState !== 'open') throw new Error('Direct connection interrupted.');
+    if (channel.bufferedAmount < 8 * 1024 * 1024) {
+      if (WEBRTC_DIAGNOSTICS_ENABLED) diagnosticAdd(state, 'bufferedAmountWait', performance.now() - waitStarted);
+      return Promise.resolve();
+    }
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(resolve, 800);
+      channel.addEventListener('bufferedamountlow', () => { clearTimeout(timer); resolve(); }, { once: true });
+      channel.addEventListener('close', () => { clearTimeout(timer); reject(new Error('Direct connection interrupted.')); }, { once: true });
     });
+    if (WEBRTC_DIAGNOSTICS_ENABLED) diagnosticAdd(state, 'bufferedAmountWait', performance.now() - waitStarted);
   }
 
   async function fallbackRelay(state, reason) {
-    if (!state || state.done || state.mode === 'fallback' || state.mode === 'fallbackstarting' || state.directDone) return;
-    state.mode = 'fallbackstarting';
-    state.status = 'Direct link unavailable · preparing laptop relay';
-    closePeer(state);
+    if (!state || state.done || state.direction !== 'out' || state.relayUploadRunning || state.relayUploadComplete || state.directDone) return;
+    state.relayUploadRunning = true;
+    state.mode = 'fallbackstarting'; state.transport = 'Laptop relay';
+    state.status = reason ? 'Direct link unavailable · switching to laptop relay' : 'Preparing laptop relay…';
+    if (!state.manualPaused && socket && socket.readyState === WebSocket.OPEN) {
+      state.connectionPaused = false; state.paused = false;
+      try { sendSocket({ type: 'transfer_health', transfer_id: state.id, connected: true, reason: 'Switching to the laptop relay.' }); } catch (_) { }
+    }
+    if (state.pc || state.channel) closePeer(state);
     renderTransfers();
+    const totalSize = state.files.reduce((sum, file) => sum + file.size, 0);
+    let retryDelay = 500;
     try {
-      sendSocket({ type: 'relay_begin', transfer_id: state.id });
+      await waitUntilTransferCanFlow(state);
+      if (!state.relayPreferenceChoice) state.relayPreferenceChoice = relayBehavior;
+      const requestedRelayMode = state.relayPreferenceChoice === 'automatic' ? 'automatic' : 'standard';
+      state.relayMode = 'pending';
+      state.relayChunkSize = DEFAULT_RELAY_CHUNK_SIZE;
+      const relayModeSelected = new Promise((resolve) => { state.resolveRelayMode = resolve; });
+      await sendTransferSocket(state, {
+        type: 'relay_begin', transfer_id: state.id,
+        mode: requestedRelayMode, chunk_size: state.relayChunkSize,
+      });
+      state.relayMode = await relayModeSelected;
+      if (state.done) return;
       if (!state.transferStarted) state.transferStarted = performance.now();
-      const totalSize = state.files.reduce((sum, file) => sum + file.size, 0);
-      let sent = 0;
-      const digests = [];
       for (let index = 0; index < state.files.length; index++) {
         const file = state.files[index];
-        const digest = await hashFile(file);
-        digests.push(digest);
+        let fileOffset = 0;
+        let refreshOffset = true;
         if (file.size === 0) {
-          const response = await fetch('/api/relay/' + encodeURIComponent(state.id) + '/' + index + '?offset=0', {
-            method: 'POST',
-            headers: { 'X-Room-Token': access, 'X-Device-ID': deviceId, 'Content-Type': 'application/octet-stream' },
-            body: new Blob([])
-          });
-          if (!response.ok) throw new Error('The laptop relay could not receive ' + file.name + '.');
-        }
-        for (let offset = 0; offset < file.size; offset += 1024 * 1024) {
-          const end = Math.min(file.size, offset + 1024 * 1024);
-          const response = await fetch('/api/relay/' + encodeURIComponent(state.id) + '/' + index + '?offset=' + offset, {
-            method: 'POST',
-            headers: { 'X-Room-Token': access, 'X-Device-ID': deviceId, 'Content-Type': 'application/octet-stream' },
-            body: file.slice(offset, end)
-          });
-          if (!response.ok) {
-            const data = await response.json().catch(() => ({}));
-            throw new Error(data.detail || 'The laptop relay could not receive ' + file.name + '.');
+          while (true) {
+            await waitUntilTransferCanFlow(state);
+            try {
+              const emptyResponse = await fetch('/api/relay/' + encodeURIComponent(state.id) + '/' + index + '?offset=0', {
+                method: 'POST', headers: { 'X-Room-Token': access, 'X-Device-ID': deviceId, 'Content-Type': 'application/octet-stream' }, body: new Blob([])
+              });
+              if (!emptyResponse.ok) {
+                if (emptyResponse.status >= 500) throw new TypeError('Relay server temporarily unavailable.');
+                const body = await emptyResponse.json().catch(() => ({})); throw new Error(body.detail || 'The laptop relay could not receive ' + file.name + '.');
+              }
+              break;
+            } catch (error) {
+              if (!(error instanceof TypeError) && navigator.onLine && (!socket || socket.readyState === WebSocket.OPEN)) throw error;
+              state.status = 'Connection interrupted · retrying empty file'; renderTransfers(); await sleep(retryDelay); retryDelay = Math.min(8000, retryDelay * 1.6);
+            }
           }
-          sent += end - offset;
-          state.progress = totalSize ? sent / totalSize * 100 : 100;
-          state.status = 'Sending through laptop · ' + prettyBytes(sent) + ' of ' + prettyBytes(totalSize);
-          sendSocket({ type: 'transfer_progress', transfer_id: state.id, loaded: sent, total: totalSize, phase: 'relay-upload' });
+        }
+        while (fileOffset < file.size) {
+          await waitUntilTransferCanFlow(state);
+          const base = '/api/relay/' + encodeURIComponent(state.id) + '/' + index;
+          const controller = new AbortController(); state.relayController = controller;
+          let requestTimeout = setTimeout(() => controller.abort(), 30000);
+          try {
+            if (refreshOffset) {
+              const offsetResponse = await fetch(base + '/offset', { headers: { 'X-Room-Token': access, 'X-Device-ID': deviceId }, signal: controller.signal });
+              if (!offsetResponse.ok) {
+                if (offsetResponse.status >= 500) throw new TypeError('Relay server temporarily unavailable.');
+                const body = await offsetResponse.json().catch(() => ({})); throw new Error(body.detail || 'The laptop relay could not resume this file.');
+              }
+              fileOffset = Number((await offsetResponse.json()).offset || 0);
+              refreshOffset = false;
+            }
+            if (fileOffset >= file.size) break;
+            const end = Math.min(file.size, fileOffset + state.relayChunkSize);
+            clearTimeout(requestTimeout); requestTimeout = setTimeout(() => controller.abort(), 30000);
+            const response = await fetch(base + '?offset=' + fileOffset, {
+              method: 'POST',
+              headers: { 'X-Room-Token': access, 'X-Device-ID': deviceId, 'Content-Type': 'application/octet-stream' },
+              body: file.slice(fileOffset, end), signal: controller.signal
+            });
+            if (!response.ok) {
+              if (response.status === 409 || response.status >= 500) throw new TypeError('Checking the saved relay position…');
+              const body = await response.json().catch(() => ({})); throw new Error(body.detail || 'The laptop relay could not receive ' + file.name + '.');
+            }
+            fileOffset = Number((await response.json()).offset || end);
+            retryDelay = 500;
+          } catch (error) {
+            if (state.done) return;
+            if (state.manualPaused || state.connectionPaused) { refreshOffset = true; await waitUntilTransferCanFlow(state); continue; }
+            if (error instanceof TypeError || error.name === 'AbortError' || !navigator.onLine || (socket && socket.readyState !== WebSocket.OPEN)) {
+              refreshOffset = true;
+              state.status = 'Connection interrupted · relay will continue from ' + prettyBytes(fileOffset);
+              renderTransfers(); await sleep(retryDelay); retryDelay = Math.min(8000, retryDelay * 1.6); continue;
+            }
+            throw error;
+          } finally { clearTimeout(requestTimeout); if (state.relayController === controller) state.relayController = null; }
+          const loaded = state.files.slice(0, index).reduce((sum, item) => sum + item.size, 0) + fileOffset;
+          state.loaded = loaded; state.progress = totalSize ? loaded / totalSize * 100 : 100;
+          updateTransferRate(state, loaded);
+          state.uploadedBytes = loaded;
+          state.uploadRateBps = state.rateBps;
+          state.status = 'Sending to laptop relay · ' + prettyBytes(loaded) + ' of ' + prettyBytes(totalSize);
+          try { sendSocket({ type: 'transfer_progress', transfer_id: state.id, loaded, total: totalSize, phase: 'relay-upload', file_index: index }); } catch (_) { }
           renderTransfers();
         }
+        if (state.relayMode === 'streaming') {
+          await sendTransferSocket(state, { type: 'relay_file_complete', transfer_id: state.id, file_index: index });
+        }
       }
-      state.mode = 'fallback';
+      await waitUntilTransferCanFlow(state);
+      state.mode = 'fallback'; state.transport = 'Laptop relay';
       state.status = 'Laptop relay ready · waiting for recipient';
-      sendSocket({ type: 'relay_ready', transfer_id: state.id, hashes: digests });
+      await sendTransferSocket(state, { type: 'relay_ready', transfer_id: state.id, hashes: [] });
+      state.relayUploadComplete = true;
       renderTransfers();
     } catch (error) {
-      failTransfer(state, error.message || (reason && reason.message) || 'The laptop relay failed.');
-    }
+      if (!state.done && error.message !== 'Transfer cancelled.') failTransfer(state, error.message || (reason && reason.message) || 'The laptop relay failed.');
+    } finally { state.relayUploadRunning = false; }
   }
+
+  function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
   async function receiveMessage(state, data) {
     if (typeof data === 'string') {
       const message = JSON.parse(data);
-      if (message.type === 'file_start') await startReceivingFile(state, message);
+      if (message.type === 'resume_ready' || message.type === 'file_ack') receiveDirectResponse(state, message);
+      else if (message.type === 'file_start') await startReceivingFile(state, message);
+      else if (message.type === 'file_block') await startReceivingBlock(state, message);
       else if (message.type === 'file_end') await finishReceivingFile(state, message.index);
       else if (message.type === 'all_done') {
         if (state.verified.size !== state.files.length) throw new Error('The recipient could not verify every file.');
-        state.status = 'Completed · integrity verified'; state.progress = 100; state.done = true;
-        sendSocket({ type: 'transfer_complete', transfer_id: state.id, ok: true });
+        state.durationSeconds = state.transferStarted ? (performance.now() - state.transferStarted) / 1000 : state.durationSeconds;
+        state.status = state.diagnosticOutput === 'memory'
+          ? 'Memory benchmark complete · verified · data discarded · ' + prettyDuration(state.durationSeconds)
+          : 'Completed · integrity verified · ' + prettyDuration(state.durationSeconds);
+        state.progress = 100; state.done = true;
+        reportTransferComplete(state, true);
         closePeer(state); renderTransfers(); expireTransfer(state);
       }
       return;
     }
-    if (!state.currentFile) throw new Error('Received file data before its metadata.');
+    if (!state.currentFile || !state.currentFile.pendingBlock) throw new Error('Received file data before its block metadata.');
+    await waitUntilTransferCanFlow(state);
     const chunk = data instanceof Blob ? await data.arrayBuffer() : data;
     const bytes = new Uint8Array(chunk);
-    state.currentFile.hash.update(bytes);
-    if (state.currentFile.writer) await state.currentFile.writer.write(bytes);
-    else state.currentFile.chunks.push(bytes);
-    state.currentFile.received += bytes.byteLength;
+    const current = state.currentFile;
+    const block = current.pendingBlock;
+    if (block.received + bytes.byteLength > block.size) throw new Error('A received block exceeded its declared size.');
+    block.chunks.push(bytes); block.received += bytes.byteLength;
+    if (state.webrtcDiagnostics) {
+      const priorMemory = state.diagnosticOutput === 'file' ? 0 : current.received;
+      state.webrtcDiagnostics.peakReceiverMemoryBytes = Math.max(
+        state.webrtcDiagnostics.peakReceiverMemoryBytes,
+        priorMemory + block.received * 2,
+      );
+    }
+    if (block.received < block.size) return;
+    const assembleStarted = WEBRTC_DIAGNOSTICS_ENABLED ? performance.now() : 0;
+    const combined = new Uint8Array(block.size);
+    let writeOffset = 0;
+    for (const part of block.chunks) { combined.set(part, writeOffset); writeOffset += part.byteLength; }
+    if (WEBRTC_DIAGNOSTICS_ENABLED) diagnosticAdd(state, 'receiverReassembly', performance.now() - assembleStarted);
+    const crcStarted = WEBRTC_DIAGNOSTICS_ENABLED ? performance.now() : 0;
+    const actualCrc = crc32Hex(combined);
+    if (WEBRTC_DIAGNOSTICS_ENABLED) diagnosticAdd(state, 'receiverCrc32', performance.now() - crcStarted);
+    if (actualCrc !== block.crc32) throw new Error('A file block failed its integrity check.');
+    if (current.writer) {
+      const writeStarted = WEBRTC_DIAGNOSTICS_ENABLED ? performance.now() : 0;
+      await current.writer.write(combined);
+      if (WEBRTC_DIAGNOSTICS_ENABLED) diagnosticAdd(state, 'receiverFileWrite', performance.now() - writeStarted);
+    } else {
+      const appendStarted = WEBRTC_DIAGNOSTICS_ENABLED ? performance.now() : 0;
+      current.chunks.push(combined);
+      if (WEBRTC_DIAGNOSTICS_ENABLED) diagnosticAdd(state, 'receiverMemoryAppend', performance.now() - appendStarted);
+    }
+    current.received += block.size; current.pendingBlock = null;
     const total = state.files.reduce((sum, file) => sum + Number(file.size || 0), 0);
-    const loadedBefore = state.files.slice(0, state.currentFile.index).reduce((sum, file) => sum + Number(file.size || 0), 0);
-    state.progress = total ? ((loadedBefore + state.currentFile.received) / total) * 100 : 100;
-    state.status = 'Receiving · ' + prettyBytes(state.currentFile.received) + ' of ' + prettyBytes(state.currentFile.size);
-    renderTransfers();
+    const loadedBefore = state.files.slice(0, current.index).reduce((sum, file) => sum + Number(file.size || 0), 0);
+    state.loaded = loadedBefore + current.received;
+    state.progress = total ? (state.loaded / total) * 100 : 100;
+    updateTransferRate(state, state.loaded);
+    state.endToEndBytes = state.loaded;
+    state.endToEndRateBps = state.rateBps;
+    try { sendSocket({ type: 'transfer_progress', transfer_id: state.id, loaded: state.loaded, total, phase: 'direct', file_index: current.index }); } catch (_) { }
+    state.status = 'Receiving · ' + prettyBytes(current.received) + ' of ' + prettyBytes(current.size);
+    try {
+      if (state.channel && state.channel.readyState === 'open') {
+        const ackSendStarted = WEBRTC_DIAGNOSTICS_ENABLED ? performance.now() : 0;
+        state.channel.send(JSON.stringify({ type: 'file_ack', index: current.index, offset: current.received, complete: false }));
+        if (WEBRTC_DIAGNOSTICS_ENABLED) diagnosticAdd(state, 'receiverAckSendCall', performance.now() - ackSendStarted);
+      }
+    } catch (_) { }
+    renderTransferProgress(state, current.received === current.size || current.received % DIRECT_CHECKPOINT_SIZE === 0);
+  }
+
+  function updateTransferRate(state, loaded) {
+    const now = performance.now();
+    if (state.rateSampleAt && now - state.rateSampleAt >= 450) {
+      const measured = Math.max(0, (loaded - state.rateSampleLoaded) / ((now - state.rateSampleAt) / 1000));
+      state.rateBps = state.rateBps ? state.rateBps * 0.55 + measured * 0.45 : measured;
+      state.rateSampleAt = now; state.rateSampleLoaded = loaded;
+    } else if (!state.rateSampleAt) { state.rateSampleAt = now; state.rateSampleLoaded = loaded; }
+  }
+
+  function renderTransferProgress(state, force = false) {
+    const now = performance.now();
+    if (force || !state.lastProgressRenderAt || now - state.lastProgressRenderAt >= 200) {
+      state.lastProgressRenderAt = now;
+      renderTransfers();
+    }
+  }
+
+  function sendDirectJSON(state, message) {
+    if (!state.channel || state.channel.readyState !== 'open') throw new Error('Direct connection interrupted.');
+    state.channel.send(JSON.stringify(message));
   }
 
   async function startReceivingFile(state, metadata) {
     if (!state.transferStarted) state.transferStarted = performance.now();
     const file = state.files[metadata.index];
     if (!file || Number(metadata.size) !== Number(file.size)) throw new Error('File metadata did not match the transfer request.');
-    state.currentFile = {
-      index: metadata.index, name: metadata.name, size: metadata.size,
-      expectedHash: metadata.sha256, hash: new SHA256(), received: 0, chunks: [], writer: null, outputName: metadata.name
-    };
-    if (state.verified.has(metadata.index)) return;
-    if (state.directory) {
-      const output = await uniqueFileHandle(state.directory, metadata.name);
-      state.currentFile.outputName = output.name;
-      state.currentFile.handle = output.handle;
-      state.currentFile.writer = await output.handle.createWritable();
+    if (state.verified.has(metadata.index)) {
+      try { sendDirectJSON(state, { type: 'resume_ready', index: metadata.index, offset: Number(file.size), complete: true }); } catch (_) { }
+      return;
     }
+    let current = state.currentFile;
+    if (current && current.index !== metadata.index) throw new Error('A different file was already in progress.');
+    if (!current) {
+      current = {
+        index: metadata.index, name: metadata.name, size: Number(metadata.size),
+        received: 0, chunks: [], writer: null, outputName: metadata.name, pendingBlock: null
+      };
+      if (state.directory) {
+        const fileOpenStarted = WEBRTC_DIAGNOSTICS_ENABLED ? performance.now() : 0;
+        const output = await uniqueFileHandle(state.directory, metadata.name);
+        current.outputName = output.name;
+        current.handle = output.handle;
+        current.writer = await output.handle.createWritable();
+        if (WEBRTC_DIAGNOSTICS_ENABLED) diagnosticAdd(state, 'receiverFileOpen', performance.now() - fileOpenStarted);
+      }
+      state.currentFile = current;
+    }
+    const safeOffset = current.received;
+    current.pendingBlock = null;
+    if (current.writer) { await current.writer.truncate(safeOffset); await current.writer.seek(safeOffset); }
+    else {
+      let retained = current.chunks.reduce((sum, part) => sum + part.byteLength, 0);
+      while (current.chunks.length && retained > safeOffset) retained -= current.chunks.pop().byteLength;
+      if (retained !== safeOffset) throw new Error('The saved receive checkpoint is unavailable.');
+    }
+    state.loaded = state.files.slice(0, metadata.index).reduce((sum, item) => sum + Number(item.size || 0), 0) + safeOffset;
+    const total = state.files.reduce((sum, item) => sum + Number(item.size || 0), 0);
+    state.progress = total ? state.loaded / total * 100 : 100;
+    state.status = safeOffset ? 'Resuming · checking saved blocks' : 'Connected · preparing first block';
+    renderTransfers();
+    try { sendSocket({ type: 'transfer_progress', transfer_id: state.id, loaded: state.loaded, total, phase: 'direct', file_index: metadata.index }); } catch (_) { }
+    try { sendDirectJSON(state, { type: 'resume_ready', index: metadata.index, offset: safeOffset, complete: false }); } catch (_) { }
+  }
+
+  async function startReceivingBlock(state, metadata) {
+    const current = state.currentFile;
+    const offset = Number(metadata.offset);
+    const size = Number(metadata.size);
+    const expectedSize = current ? Math.min(DIRECT_CHECKPOINT_SIZE, current.size - current.received) : 0;
+    if (!current || current.index !== Number(metadata.index) || current.pendingBlock || offset !== current.received || size !== expectedSize || size <= 0 || !/^[0-9a-f]{8}$/i.test(String(metadata.crc32 || ''))) {
+      throw new Error('The received block information is invalid.');
+    }
+    current.pendingBlock = { size, offset, crc32: String(metadata.crc32).toLowerCase(), received: 0, chunks: [] };
+    state.status = 'Receiving · verifying block ' + (Math.floor(offset / DIRECT_CHECKPOINT_SIZE) + 1);
   }
 
   async function finishReceivingFile(state, index) {
     const current = state.currentFile;
     if (!current || current.index !== index) throw new Error('File transfer sequence is invalid.');
-    const digest = current.hash.digest();
-    if (digest !== current.expectedHash || current.received !== current.size) {
+    if (current.pendingBlock || current.received !== current.size) {
       if (current.writer) await current.writer.abort().catch(() => { });
       if (current.handle && state.directory) await state.directory.removeEntry(current.outputName).catch(() => { });
       state.currentFile = null;
-      throw new Error('Integrity check failed for ' + current.name + '. The file was discarded.');
+      throw new Error('The received file is incomplete and was discarded.');
     }
-    if (current.writer) await current.writer.close();
-    else downloadBlob(new Blob(current.chunks, { type: 'application/octet-stream' }), current.outputName);
+    if (current.writer) {
+      const closeStarted = WEBRTC_DIAGNOSTICS_ENABLED ? performance.now() : 0;
+      await current.writer.close();
+      if (WEBRTC_DIAGNOSTICS_ENABLED) diagnosticAdd(state, 'receiverFileClose', performance.now() - closeStarted);
+    }
+    else if (!(WEBRTC_DIAGNOSTICS_ENABLED && state.diagnosticOutput === 'memory')) {
+      const blobStarted = WEBRTC_DIAGNOSTICS_ENABLED ? performance.now() : 0;
+      downloadBlob(new Blob(current.chunks, { type: 'application/octet-stream' }), current.outputName);
+      if (WEBRTC_DIAGNOSTICS_ENABLED) diagnosticAdd(state, 'browserBlobCreateAndDownloadTrigger', performance.now() - blobStarted);
+    }
     state.verified.add(index);
+    state.loaded = state.files.slice(0, index + 1).reduce((sum, file) => sum + Number(file.size || 0), 0);
     state.currentFile = null;
+    try { sendDirectJSON(state, { type: 'file_ack', index, offset: current.size, complete: true }); } catch (_) { }
   }
 
-  async function receiveRelay(state, relayFiles) {
-    state.mode = 'fallback';
-    state.status = 'Downloading through the laptop relay…';
+  async function receiveRelay(state, relayFiles = state.relayFiles, streaming = state.relayMode === 'streaming') {
+    if (state.relayReceiveRunning || state.done) return;
+    state.relayReceiveRunning = true; state.relayFiles = relayFiles;
+    state.mode = 'fallback'; state.transport = 'Laptop relay';
+    state.status = streaming ? 'Live relay · receiving saved blocks' : 'Downloading through the laptop relay…';
     if (!state.transferStarted) state.transferStarted = performance.now();
     renderTransfers();
     const totalSize = state.files.reduce((sum, file) => sum + Number(file.size || 0), 0);
-    let receivedAll = 0;
     try {
       for (let index = 0; index < state.files.length; index++) {
-        if (state.verified.has(index)) { receivedAll += Number(state.files[index].size || 0); continue; }
-        const item = relayFiles[index];
-        if (!item || item.sha256 !== (state.files[index].sha256 || item.sha256)) throw new Error('The relay sent unexpected file information.');
-        const response = await fetch('/api/relay/' + encodeURIComponent(state.id) + '/' + index, {
-          headers: { 'X-Room-Token': access, 'X-Device-ID': deviceId }
-        });
-        if (!response.ok || !response.body) throw new Error('Could not download ' + state.files[index].name + ' from the laptop relay.');
-        const output = await openOutput(state, state.files[index].name);
-        const reader = response.body.getReader();
-        const hash = new SHA256();
-        let received = 0;
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          hash.update(value);
-          if (output.writer) await output.writer.write(value); else output.chunks.push(value);
-          received += value.byteLength;
-          state.status = 'Receiving through laptop · ' + prettyBytes(receivedAll + received) + ' of ' + prettyBytes(totalSize) + ' · ' + measuredRate(receivedAll + received, state.transferStarted);
-          state.progress = totalSize ? (receivedAll + received) / totalSize * 100 : 100;
-          renderTransfers();
+        if (state.verified.has(index)) continue;
+        let item = relayFiles && relayFiles[index];
+        if (!streaming && (!item || item.sha256 !== (state.files[index].sha256 || item.sha256))) throw new Error('The relay sent unexpected file information.');
+        let part = state.relayParts.get(index);
+        if (!part) {
+          const output = await openOutput(state, state.files[index].name);
+          part = { output, crcState: 0xffffffff, received: 0 };
+          state.relayParts.set(index, part);
         }
-        const expected = item.sha256 || response.headers.get('X-Content-SHA256');
-        if (received !== Number(state.files[index].size) || hash.digest() !== expected) {
-          if (output.writer) await output.writer.abort().catch(() => { });
-          if (output.handle && state.directory) await state.directory.removeEntry(output.name).catch(() => { });
+        let retryDelay = 500;
+        let lastProgressBytes = part.received;
+        let lastProgressAt = performance.now();
+        while (part.received < Number(state.files[index].size)) {
+          await waitUntilTransferCanFlow(state);
+          const controller = new AbortController(); state.relayController = controller;
+          let timeout = setTimeout(() => controller.abort(), 30000);
+          try {
+            const streamQuery = streaming ? '&stream=1' : '';
+            const response = await fetch('/api/relay/' + encodeURIComponent(state.id) + '/' + index + '?offset=' + part.received + streamQuery, {
+              headers: { 'X-Room-Token': access, 'X-Device-ID': deviceId }, signal: controller.signal
+            });
+            if (!response.ok || !response.body) {
+              if (response.status === 409 || response.status >= 500) throw new TypeError('Relay connection is temporarily unavailable.');
+              throw new Error('Could not download ' + state.files[index].name + ' from the laptop relay.');
+            }
+            part.expectedCrc = response.headers.get('X-Content-CRC32') || (item && item.crc32) || part.expectedCrc;
+            const reader = response.body.getReader();
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              clearTimeout(timeout); timeout = setTimeout(() => controller.abort(), 30000);
+              await waitUntilTransferCanFlow(state);
+              if (part.received + value.byteLength > Number(state.files[index].size)) throw new Error('The relay sent more data than the requested file size.');
+              if (part.output.writer) await part.output.writer.write(value); else part.output.chunks.push(value);
+              part.crcState = crc32Update(part.crcState, value); part.received += value.byteLength;
+              const loaded = state.files.slice(0, index).reduce((sum, file) => sum + Number(file.size || 0), 0) + part.received;
+              state.loaded = loaded; state.progress = totalSize ? loaded / totalSize * 100 : 100;
+              updateTransferRate(state, loaded);
+              state.downloadedBytes = loaded;
+              state.endToEndBytes = loaded;
+              state.downloadRateBps = state.rateBps;
+              state.endToEndRateBps = state.rateBps;
+              state.status = 'Receiving from laptop relay · ' + prettyBytes(loaded) + ' of ' + prettyBytes(totalSize);
+              const progressNow = performance.now();
+              if (part.received - lastProgressBytes >= 256 * 1024 || progressNow - lastProgressAt >= 250 || part.received === Number(state.files[index].size)) {
+                try { sendSocket({ type: 'transfer_progress', transfer_id: state.id, loaded, total: totalSize, phase: 'relay-download', file_index: index }); } catch (_) { }
+                lastProgressBytes = part.received;
+                lastProgressAt = progressNow;
+              }
+              renderTransferProgress(state, part.received === Number(state.files[index].size));
+            }
+            retryDelay = 500;
+          } catch (error) {
+            if (state.done) return;
+            if (state.manualPaused || state.connectionPaused) {
+              state.status = state.manualPaused ? 'Paused by you' : 'Connection interrupted · download paused';
+              renderTransfers(); await waitUntilTransferCanFlow(state); continue;
+            }
+            if (error instanceof TypeError || error.name === 'AbortError' || !navigator.onLine) {
+              state.status = 'Connection interrupted · resuming download from ' + prettyBytes(part.received);
+              renderTransfers(); await sleep(retryDelay); retryDelay = Math.min(8000, retryDelay * 1.6); continue;
+            }
+            throw error;
+          } finally {
+            clearTimeout(timeout);
+            if (state.relayController === controller) state.relayController = null;
+          }
+        }
+        if (streaming) {
+          item = await waitForRelayFile(state, index);
+          relayFiles = state.relayFiles || relayFiles;
+          if (!item || item.sha256 !== (state.files[index].sha256 || item.sha256)) throw new Error('The relay sent unexpected file information.');
+          part.expectedCrc = item.crc32;
+        }
+        const actualCrc = ((part.crcState ^ 0xffffffff) >>> 0).toString(16).padStart(8, '0');
+        if (!item || part.received !== Number(state.files[index].size) || actualCrc !== String(part.expectedCrc || item.crc32 || '').toLowerCase()) {
+          if (part.output.writer) await part.output.writer.abort().catch(() => { });
+          if (part.output.handle && state.directory) await state.directory.removeEntry(part.output.name).catch(() => { });
+          state.relayParts.delete(index);
           throw new Error('Integrity check failed for ' + state.files[index].name + '.');
         }
-        if (output.writer) await output.writer.close();
-        else downloadBlob(new Blob(output.chunks, { type: 'application/octet-stream' }), output.name);
+        if (part.output.writer) await part.output.writer.close();
+        else downloadBlob(new Blob(part.output.chunks, { type: 'application/octet-stream' }), part.output.name);
         state.verified.add(index);
-        receivedAll += received;
+        state.loaded = state.files.slice(0, index + 1).reduce((sum, file) => sum + Number(file.size || 0), 0);
       }
-      state.status = 'Completed · integrity verified'; state.progress = 100; state.done = true;
-      sendSocket({ type: 'transfer_complete', transfer_id: state.id, ok: true });
+      state.durationSeconds = state.transferStarted ? (performance.now() - state.transferStarted) / 1000 : state.durationSeconds;
+      state.status = 'Completed · integrity verified · ' + prettyDuration(state.durationSeconds); state.progress = 100; state.done = true;
+      reportTransferComplete(state, true);
       renderTransfers(); expireTransfer(state);
-    } catch (error) { throw error; }
+    } finally { state.relayReceiveRunning = false; }
+  }
+
+  function resolveRelayFile(state, index, file) {
+    if (!state.relayFileWaiters) state.relayFileWaiters = new Map();
+    const waiter = state.relayFileWaiters.get(index);
+    if (waiter) {
+      state.relayFileWaiters.delete(index);
+      waiter(file);
+    }
+  }
+
+  function waitForRelayFile(state, index) {
+    const current = state.relayFiles && state.relayFiles[index];
+    if (current) return Promise.resolve(current);
+    if (!state.relayFileWaiters) state.relayFileWaiters = new Map();
+    return new Promise((resolve) => state.relayFileWaiters.set(index, resolve));
+  }
+
+  function reportTransferComplete(state, ok, message = '') {
+    try {
+      sendSocket({ type: 'transfer_complete', transfer_id: state.id, ok, message });
+      state.localCompletePending = false;
+    } catch (_) { state.localCompletePending = !!ok; }
   }
 
   async function openOutput(state, requestedName) {
@@ -962,15 +2033,8 @@
     setTimeout(() => URL.revokeObjectURL(url), 30000);
   }
 
-  async function hashFile(file) {
-    const hash = new SHA256();
-    for (let offset = 0; offset < file.size; offset += 1024 * 1024) {
-      hash.update(new Uint8Array(await file.slice(offset, Math.min(file.size, offset + 1024 * 1024)).arrayBuffer()));
-    }
-    return hash.digest();
-  }
-
   function failTransfer(state, message) {
+    if (state.resolveRelayMode) { state.resolveRelayMode('disk'); state.resolveRelayMode = null; }
     state.status = message || 'Transfer failed'; state.done = true;
     abortPartialReceive(state).catch(() => { });
     closePeer(state);
@@ -981,11 +2045,16 @@
   }
 
   function closePeer(state) {
-    if (state.channel) { try { state.channel.close(); } catch (_) { } }
-    if (state.pc) { try { state.pc.close(); } catch (_) { } }
+    stopWebRtcDiagnostics(state);
+    rejectDirectWaiters(state, 'Transfer closed.');
+    const channel = state.channel; state.channel = null;
+    const pc = state.pc; state.pc = null;
+    if (channel) { try { channel.close(); } catch (_) { } }
+    if (pc) { try { pc.close(); } catch (_) { } }
   }
 
   function cancelTransfer(state) {
+    if (state.resolveRelayMode) { state.resolveRelayMode('disk'); state.resolveRelayMode = null; }
     state.status = 'Cancelled'; state.done = true;
     abortPartialReceive(state).catch(() => { });
     closePeer(state);
@@ -1007,6 +2076,11 @@
     this.h = new Uint32Array([0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19]);
     this.buffer = new Uint8Array(0); this.bytes = 0;
   }
+  SHA256.prototype.clone = function () {
+    const copy = new SHA256();
+    copy.h = this.h.slice(); copy.buffer = this.buffer.slice(); copy.bytes = this.bytes;
+    return copy;
+  };
   SHA256.K = new Uint32Array([0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2]);
   SHA256.prototype.update = function (input) {
     const data = new Uint8Array(this.buffer.length + input.length);
@@ -1205,6 +2279,14 @@
 
   function initEvents() {
     initTabs();
+    initWebRtcDiagnostics();
+    const relayBehaviorSelect = byId('relay-behavior');
+    relayBehaviorSelect.value = relayBehavior;
+    relayBehaviorSelect.addEventListener('change', () => {
+      relayBehavior = relayBehaviorSelect.value === 'standard' ? 'standard' : 'automatic';
+      localStorage.setItem(RELAY_BEHAVIOR_PREF, relayBehavior);
+      toast('Relay download behaviour saved for future transfers.');
+    });
     byId('note-text').addEventListener('input', updateNoteCharacterCount);
     byId('note-recipient').addEventListener('change', updateNoteSendButton);
     byId('paste-note').addEventListener('click', pasteNote);

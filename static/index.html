@@ -84,7 +84,33 @@
               <p class="footnote">The recipient must accept before transfer begins. A laptop relay is used if direct WebRTC is unavailable.</p>
             </article>
           </div>
-          <section class="transfer-area"><div class="section-heading compact-heading"><div><div class="eyebrow">ACTIVITY</div><h2>Incoming and outgoing</h2></div></div><div id="transfers-list" class="transfers-list"><div class="empty-state">Transfers will appear here.</div></div></section>
+          <section class="transfer-area">
+            <article class="card performance-dashboard" aria-labelledby="performance-title">
+              <div class="performance-header"><div><div class="eyebrow">LIVE PERFORMANCE</div><h3 id="performance-title">Transfer overview</h3></div><span id="performance-live" class="performance-live"><i></i> Live</span></div>
+              <div class="performance-grid">
+                <div class="performance-metric"><span>Active transfers</span><strong id="performance-active">0</strong></div>
+                <div class="performance-metric"><span>End-to-end speed</span><strong id="performance-speed">0 MB/s</strong></div>
+                <div class="performance-metric"><span>Recipient data</span><strong id="performance-data">0 B</strong></div>
+                <div class="performance-metric"><span>Room connection</span><strong id="performance-connection">Connecting…</strong></div>
+                <div class="performance-metric"><span>Sender → laptop</span><strong id="performance-upload">0 MB/s</strong></div>
+                <div class="performance-metric"><span>Laptop → recipient</span><strong id="performance-download">0 MB/s</strong></div>
+                <div class="performance-metric"><span>Transfer duration</span><strong id="performance-duration">0 s</strong></div>
+                <div class="performance-metric"><span>Host CPU / memory</span><strong id="performance-host-load">—</strong></div>
+              </div>
+              <p id="performance-hint" class="performance-hint">Each transfer shows its route, current speed, progress, and estimated time remaining.</p>
+            </article>
+            <article id="webrtc-diagnostics-card" class="card webrtc-diagnostics-card" hidden aria-labelledby="webrtc-diagnostics-title">
+              <div class="diagnostics-header">
+                <div><div class="eyebrow">TEMPORARY TEST TOOLS</div><h3 id="webrtc-diagnostics-title">WebRTC diagnostics</h3></div>
+                <div class="button-row"><button id="download-webrtc-report" class="button secondary compact">Download report</button><button id="clear-webrtc-report" class="button secondary compact">Clear</button></div>
+              </div>
+              <p id="webrtc-diagnostics-mode" class="muted small"></p>
+              <p class="footnote">Enable with <code>&amp;webrtc-diagnostics=1</code>. For a receiving comparison, use <code>&amp;webrtc-output=memory</code> and then <code>&amp;webrtc-output=file</code>. File mode asks for a destination folder when you accept. Memory mode verifies the data and discards it without saving. Enable diagnostics on both devices to capture both views.</p>
+              <pre id="webrtc-diagnostics-summary" class="webrtc-diagnostics-summary">Waiting for a WebRTC transfer.</pre>
+            </article>
+            <div class="section-heading compact-heading"><div><div class="eyebrow">ACTIVITY</div><h2>Incoming and outgoing</h2></div></div>
+            <div id="transfers-list" class="transfers-list"><div class="empty-state">Transfers will appear here.</div></div>
+          </section>
         </section>
 
         <section id="shared-view" class="view">
@@ -143,6 +169,16 @@
               <div class="eyebrow">HOST PREFERENCES</div><h3>File size limit</h3><p class="muted small">Maximum size for each server upload and device transfer.</p>
               <div class="limit-row"><input id="max-file-mb" type="number" min="1" max="100000" value="2048"><span>MB per file</span><button id="save-limit" class="button secondary">Save</button></div>
               <p class="footnote">The setting is saved on this laptop in QuickDrop/settings.json.</p>
+            </article>
+            <article class="card network-card">
+              <div class="eyebrow">TRANSFER PREFERENCES</div><h3>Relay download behaviour</h3>
+              <label class="field-label" for="relay-behavior">When a laptop relay is needed</label>
+              <select id="relay-behavior" class="full-input">
+                <option value="automatic">Automatic (Recommended)</option>
+                <option value="standard">Standard</option>
+              </select>
+              <p class="muted small">Automatic starts downloading verified files during upload when the recipient can save to a chosen folder. Otherwise QuickDrop uses Standard relay.</p>
+              <p class="footnote">The recipient is asked to choose a folder only if Live Relay is available and needed.</p>
             </article>
             <article class="card network-card">
               <div class="eyebrow">BROWSER SUPPORT</div><h3>HTTPS and direct transfers</h3>

@@ -1,15 +1,18 @@
 import base64
+import asyncio
 import hashlib
 import io
 import socket
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from uuid import uuid4
 
+import pytest
 from fastapi.testclient import TestClient
 
 from quickdrop import network, storage
-from quickdrop.server import _qr_data_uri, create_app
+from quickdrop.server import _qr_data_uri, _stream_verified_relay_file, create_app
 
 
 def make_client(tmp_path, max_file_mb=2):
@@ -314,10 +317,13 @@ def test_accepted_transfer_uses_verified_server_relay_fallback(tmp_path):
                 sender.send_json({"type": "transfer_request", "to": "device_phone_0012", "files": [{"name": "data.bin", "size": len(payload)}]})
                 pending = sender.receive_json()
                 incoming = recipient.receive_json()
-                recipient.send_json({"type": "transfer_decision", "transfer_id": pending["transfer_id"], "accepted": True})
+                recipient.send_json({"type": "transfer_decision", "transfer_id": pending["transfer_id"], "accepted": True, "relay_stream_capable": True})
                 sender.receive_json()
-                sender.send_json({"type": "relay_begin", "transfer_id": pending["transfer_id"]})
-                assert recipient.receive_json()["type"] == "relay_begin"
+                sender.send_json({"type": "relay_begin", "transfer_id": pending["transfer_id"], "mode": "standard", "chunk_size": 1024 * 1024})
+                relay_mode = recipient.receive_json()
+                assert relay_mode["type"] == "relay_begin"
+                assert relay_mode["mode"] == "disk"
+                assert sender.receive_json()["type"] == "relay_mode_selected"
 
                 upload = client.post(
                     f"/api/relay/{pending['transfer_id']}/0?offset=0",
@@ -345,8 +351,13 @@ def test_accepted_transfer_uses_verified_server_relay_fallback(tmp_path):
                 incoming = recipient.receive_json()
                 recipient.send_json({"type": "transfer_decision", "transfer_id": pending["transfer_id"], "accepted": True})
                 sender.receive_json()
-                sender.send_json({"type": "relay_begin", "transfer_id": pending["transfer_id"]})
-                recipient.receive_json()
+                sender.send_json({"type": "relay_begin", "transfer_id": pending["transfer_id"], "mode": "automatic"})
+                pending_mode = recipient.receive_json()
+                assert pending_mode["type"] == "relay_begin"
+                assert pending_mode["mode"] == "automatic"
+                recipient.send_json({"type": "relay_mode_decision", "transfer_id": pending["transfer_id"], "mode": "disk", "capable": False})
+                assert recipient.receive_json()["mode"] == "disk"
+                assert sender.receive_json()["mode"] == "disk"
                 client.post(
                     f"/api/relay/{pending['transfer_id']}/0?offset=0",
                     headers={"X-Room-Token": token, "X-Device-ID": "device_sender_0011"},
@@ -356,6 +367,211 @@ def test_accepted_transfer_uses_verified_server_relay_fallback(tmp_path):
                 mismatch = sender.receive_json()
                 assert mismatch["type"] == "transfer_error"
                 assert "verify" in mismatch["message"].lower()
+
+
+def test_relay_chunk_storage_bounds_buffer_and_commits_only_complete_chunks(tmp_path):
+    target = tmp_path / "relay.bin"
+
+    async def body():
+        yield b"first "
+        yield b"chunk"
+
+    offset = asyncio.run(storage.write_relay_chunk(
+        target, body(), offset=0, expected_size=20, max_chunk=11, content_length=11
+    ))
+    assert offset == 11
+    assert target.read_bytes() == b"first chunk"
+
+    async def oversized_body():
+        yield b"too large"
+
+    with pytest.raises(ValueError):
+        asyncio.run(storage.write_relay_chunk(
+            target, oversized_body(), offset=11, expected_size=20, max_chunk=4, content_length=9
+        ))
+    assert target.read_bytes() == b"first chunk"
+
+
+def test_streaming_relay_download_can_finish_verified_file_before_batch_ready(tmp_path):
+    first = b"first file: " + bytes(range(64))
+    second = b"second file follows"
+    with make_client(tmp_path) as client:
+        room, token, _ = room_credentials(client)
+        with client.websocket_connect(f"/ws?room={room}&token={token}") as sender:
+            sender.send_json({"type": "join", "device_id": "device_sender_0021", "name": "Sender", "device_type": "Computer"})
+            sender.receive_json()
+            with client.websocket_connect(f"/ws?room={room}&token={token}") as recipient:
+                recipient.send_json({"type": "join", "device_id": "device_phone_0022", "name": "Recipient", "device_type": "Phone"})
+                sender.receive_json(); recipient.receive_json()
+                sender.send_json({
+                    "type": "transfer_request", "to": "device_phone_0022",
+                    "files": [{"name": "first.bin", "size": len(first)}, {"name": "second.bin", "size": len(second)}],
+                })
+                pending = sender.receive_json()
+                recipient.receive_json()
+                recipient.send_json({"type": "transfer_decision", "transfer_id": pending["transfer_id"], "accepted": True})
+                sender.receive_json()
+                sender.send_json({"type": "relay_begin", "transfer_id": pending["transfer_id"], "mode": "automatic", "chunk_size": 1024 * 1024})
+                begun = recipient.receive_json()
+                assert begun["type"] == "relay_begin"
+                assert begun["mode"] == "automatic"
+                recipient.send_json({"type": "relay_mode_decision", "transfer_id": pending["transfer_id"], "mode": "streaming", "capable": True})
+                assert recipient.receive_json()["mode"] == "streaming"
+                assert sender.receive_json()["mode"] == "streaming"
+
+                headers = {"X-Room-Token": token, "X-Device-ID": "device_sender_0021"}
+                upload_url = f"/api/relay/{pending['transfer_id']}/0?offset=0"
+                split = len(first) // 2
+                partial = client.post(upload_url, headers=headers, content=first[:split])
+                assert partial.status_code == 200
+                saved_position = client.get(f"/api/relay/{pending['transfer_id']}/0/offset", headers=headers)
+                assert saved_position.status_code == 200
+                assert saved_position.json()["offset"] == split
+                stale_retry = client.post(upload_url, headers=headers, content=first[:split])
+                assert stale_retry.status_code == 409
+
+                download_headers = {"X-Room-Token": token, "X-Device-ID": "device_phone_0022"}
+                download_url = f"/api/relay/{pending['transfer_id']}/0?offset=0&stream=1"
+                with ThreadPoolExecutor(max_workers=1) as workers:
+                    pending_download = workers.submit(client.get, download_url, headers=download_headers)
+                    remainder = client.post(
+                        f"/api/relay/{pending['transfer_id']}/0?offset={split}",
+                        headers=headers,
+                        content=first[split:],
+                    )
+                    assert remainder.status_code == 200
+                    sender.send_json({"type": "relay_file_complete", "transfer_id": pending["transfer_id"], "file_index": 0})
+                    file_ready = recipient.receive_json()
+                    assert file_ready["type"] == "relay_file_ready"
+                    assert file_ready["file_index"] == 0
+                    streamed = pending_download.result(timeout=5)
+
+                assert streamed.status_code == 200
+                assert streamed.content == first
+                current = client.get(
+                    f"/api/relay/{pending['transfer_id']}/0?offset=0",
+                    headers=download_headers,
+                )
+                assert current.status_code == 409
+
+                second_upload = client.post(
+                    f"/api/relay/{pending['transfer_id']}/1?offset=0",
+                    headers=headers,
+                    content=second,
+                )
+                assert second_upload.status_code == 200
+                sender.send_json({"type": "relay_file_complete", "transfer_id": pending["transfer_id"], "file_index": 1})
+                assert recipient.receive_json()["type"] == "relay_file_ready"
+
+                total_size = len(first) + len(second)
+                sender.send_json({
+                    "type": "transfer_progress", "transfer_id": pending["transfer_id"],
+                    "loaded": len(first), "total": total_size, "phase": "relay-upload", "file_index": 0,
+                })
+                assert recipient.receive_json()["phase"] == "relay-upload"
+                recipient.send_json({
+                    "type": "transfer_progress", "transfer_id": pending["transfer_id"],
+                    "loaded": len(first), "total": total_size, "phase": "relay-download", "file_index": 0,
+                })
+                assert sender.receive_json()["phase"] == "relay-download"
+                performance = client.get(
+                    "/api/transfers/performance",
+                    headers={"X-Room-Token": token, "X-Device-ID": "device_sender_0021"},
+                )
+                assert performance.status_code == 200
+                snapshot = performance.json()
+                assert snapshot["active_transfers"][0]["uploaded_bytes"] == len(first) + len(second)
+                assert snapshot["active_transfers"][0]["downloaded_bytes"] == len(first)
+                assert snapshot["active_transfers"][0]["end_to_end_bytes"] == len(first)
+                assert snapshot["host_memory_bytes"] > 0
+                sender.send_json({"type": "relay_ready", "transfer_id": pending["transfer_id"], "hashes": []})
+                assert recipient.receive_json()["type"] == "relay_ready"
+
+
+def test_live_relay_stream_waits_until_whole_file_is_verified(tmp_path):
+    payload = b"complete file contents"
+    path = tmp_path / "relay-file.bin"
+    path.write_bytes(payload)
+    relay_file = {
+        "condition": asyncio.Condition(),
+        "committed_offset": len(payload) // 2,
+        "verified": False,
+        "failure": None,
+    }
+
+    async def verify_stream_waits():
+        stream = _stream_verified_relay_file(
+            path, relay_file, len(payload), 5, asyncio.Semaphore(1)
+        )
+        first_chunk = asyncio.create_task(anext(stream))
+        await asyncio.sleep(0)
+        assert not first_chunk.done()
+
+        async with relay_file["condition"]:
+            relay_file["committed_offset"] = len(payload)
+            relay_file["condition"].notify_all()
+        await asyncio.sleep(0)
+        assert not first_chunk.done(), "a complete but unverified file must not be exposed"
+
+        async with relay_file["condition"]:
+            relay_file["verified"] = True
+            relay_file["condition"].notify_all()
+        chunks = [await first_chunk]
+        async for chunk in stream:
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    assert asyncio.run(verify_stream_waits()) == payload
+
+
+def test_relay_chunk_sizes_are_benchmarkable_values():
+    assert storage.RELAY_CHUNK_SIZES == (1, 2, 4, 8)
+
+
+def test_streaming_reconnect_replays_verified_file_metadata(tmp_path):
+    payload = b"already committed"
+    with make_client(tmp_path) as client:
+        room, token, _ = room_credentials(client)
+        with client.websocket_connect(f"/ws?room={room}&token={token}") as sender:
+            sender.send_json({"type": "join", "device_id": "device_sender_0031", "name": "Sender", "device_type": "Computer"})
+            sender.receive_json()
+            with client.websocket_connect(f"/ws?room={room}&token={token}") as recipient:
+                recipient.send_json({"type": "join", "device_id": "device_phone_0032", "name": "Recipient", "device_type": "Phone"})
+                sender.receive_json(); recipient.receive_json()
+                sender.send_json({
+                    "type": "transfer_request", "to": "device_phone_0032",
+                    "files": [{"name": "saved.bin", "size": len(payload)}],
+                })
+                pending = sender.receive_json()
+                recipient.receive_json()
+                recipient.send_json({"type": "transfer_decision", "transfer_id": pending["transfer_id"], "accepted": True})
+                sender.receive_json()
+                sender.send_json({"type": "relay_begin", "transfer_id": pending["transfer_id"], "mode": "automatic"})
+                assert recipient.receive_json()["mode"] == "automatic"
+                recipient.send_json({"type": "relay_mode_decision", "transfer_id": pending["transfer_id"], "mode": "streaming", "capable": True})
+                assert recipient.receive_json()["mode"] == "streaming"
+                assert sender.receive_json()["mode"] == "streaming"
+                uploaded = client.post(
+                    f"/api/relay/{pending['transfer_id']}/0?offset=0",
+                    headers={"X-Room-Token": token, "X-Device-ID": "device_sender_0031"},
+                    content=payload,
+                )
+                assert uploaded.status_code == 200
+                sender.send_json({"type": "relay_file_complete", "transfer_id": pending["transfer_id"], "file_index": 0})
+                assert recipient.receive_json()["type"] == "relay_file_ready"
+                recipient.close()
+
+                with client.websocket_connect(f"/ws?room={room}&token={token}") as reconnected:
+                    reconnected.send_json({"type": "join", "device_id": "device_phone_0032", "name": "Recipient", "device_type": "Phone"})
+                    assert reconnected.receive_json()["type"] == "devices"
+                    while True:
+                        message = reconnected.receive_json()
+                        if message.get("type") == "relay_begin":
+                            break
+                    replayed_file = reconnected.receive_json()
+                    assert replayed_file["type"] == "relay_file_ready"
+                    assert replayed_file["file_index"] == 0
+                    assert replayed_file["file"]["sha256"] == hashlib.sha256(payload).hexdigest()
 
 
 def test_hotspot_failure_is_reported_and_manual_mode_builds_wifi_qr(tmp_path, monkeypatch):

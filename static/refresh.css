@@ -158,7 +158,32 @@ body {
   border-color: #8983ed;
   box-shadow: 0 0 0 3px rgba(111, 103, 229, 0.13);
 }
-.transfer-item { border-radius: 14px; }
+.transfer-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  border-radius: 14px;
+}
+.transfer-summary {
+  display: grid;
+  grid-template-columns: 36px minmax(0, 1fr) minmax(120px, max-content);
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+.transfer-summary > .transfer-icon { align-self: center; }
+.transfer-summary > .transfer-main { min-width: 0; }
+.transfer-summary > .transfer-status { max-width: 270px; margin: 0; }
+.transfer-metrics { grid-column: 2; color: var(--muted); font-size: 10px; line-height: 1.5; overflow-wrap: anywhere; }
+.transfer-item > .progress-track {
+  width: auto !important;
+  min-width: 0;
+  margin: 0;
+}
+.transfer-item > .transfer-actions { justify-self: end; width: auto; padding-left: 0; }
+.transfer-item > .relay-choice-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+.relay-choice-actions .button { min-width: 110px; }
 .progress-track { height: 6px; }
 .progress-track span { background: linear-gradient(90deg, #7169eb, #22b8a0); }
 .shared-file { min-height: 58px; }
@@ -167,6 +192,21 @@ body {
 .download-link:hover { background: #f1f0ff; }
 .note-textarea { border-radius: 12px; }
 .note-item { border-radius: 13px; }
+.performance-dashboard { margin-bottom: 20px; padding: 18px 20px; }
+.performance-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.performance-header h3 { margin: 4px 0 0; font: 700 16px Manrope, sans-serif; letter-spacing: -0.4px; }
+.performance-live { display: inline-flex; align-items: center; gap: 7px; color: #158568; background: #eaf8f3; padding: 6px 9px; border-radius: 999px; font-size: 10px; font-weight: 700; }
+.performance-live i { width: 7px; height: 7px; border-radius: 50%; background: #16ae82; box-shadow: 0 0 0 3px rgba(22, 174, 130, .12); }
+.performance-live.is-paused { color: #a46717; background: #fff4de; }
+.performance-live.is-paused i { background: #e7a53d; box-shadow: 0 0 0 3px rgba(231, 165, 61, .13); }
+.performance-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-top: 16px; }
+.performance-metric { min-width: 0; padding: 12px 13px; border: 1px solid var(--line); border-radius: 12px; background: linear-gradient(145deg, #fbfbff, #f6f8fc); }
+.performance-metric span { display: block; color: var(--muted); font-size: 10px; }
+.performance-metric strong { display: block; margin-top: 5px; font: 700 17px Manrope, sans-serif; letter-spacing: -.3px; overflow-wrap: anywhere; }
+.performance-hint { margin: 12px 1px 0; color: var(--muted); font-size: 10px; line-height: 1.5; }
+.transfer-control-buttons { display: flex; gap: 6px; }
+.transfer-control-buttons .button { min-width: 75px; }
+.transfer-status { overflow-wrap: anywhere; }
 .network-card { transition: transform 160ms ease, box-shadow 160ms ease; }
 .network-card:hover { transform: translateY(-2px); box-shadow: 0 15px 34px rgba(37, 43, 91, 0.09); }
 .footer { border-top-color: var(--line); }
@@ -206,6 +246,15 @@ body.dark .tab b { background: #30364a; color: #c5c0ff; }
 body.dark .tab.active b { background: rgba(255, 255, 255, 0.2); color: #fff; }
 body.dark .note-item { background: #1d2434; }
 body.dark .download-link:hover { background: #292744; }
+body.dark .performance-metric { background: linear-gradient(145deg, #1c2232, #20263a); }
+body.dark .performance-live { color: #7fe0bd; background: #1b3937; }
+body.dark .performance-live.is-paused { color: #f0c777; background: #3a3020; }
+
+.webrtc-diagnostics-card { grid-column: 1 / -1; }
+.diagnostics-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.diagnostics-header h3 { margin: 3px 0 0; }
+.webrtc-diagnostics-summary { max-height: 360px; overflow: auto; margin: 12px 0 0; padding: 12px; border: 1px solid #dfe4ef; border-radius: 10px; background: #f7f8fc; color: #24304a; font: 12px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+body.dark .webrtc-diagnostics-summary { border-color: #30384a; background: #171d2a; color: #dce4f5; }
 
 @media (max-width: 560px) {
   .welcome-row { padding-top: 26px; }
@@ -218,6 +267,19 @@ body.dark .download-link:hover { background: #292744; }
   .invite-card, .identity-card, .send-card { border-radius: 15px; }
   .button { min-height: 42px; }
   .button.compact { min-height: 36px; }
+  .transfer-item { gap: 8px; }
+  .transfer-summary { grid-template-columns: 36px minmax(0, 1fr); grid-template-rows: auto auto; align-items: start; gap: 5px 10px; }
+  .transfer-summary > .transfer-icon { grid-column: 1; grid-row: 1 / span 2; align-self: center; }
+  .transfer-summary > .transfer-main { grid-column: 2; grid-row: 1; }
+  .transfer-summary > .transfer-status { grid-column: 2; grid-row: 2; max-width: none; text-align: left; }
+  .transfer-metrics { grid-column: 2; }
+  .transfer-item > .transfer-actions { justify-self: start; }
+  .performance-dashboard { padding: 15px; }
+  .performance-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .performance-metric { padding: 10px; }
+  .performance-metric strong { font-size: 15px; }
+  .transfer-control-buttons { width: 100%; }
+  .transfer-control-buttons .button { flex: 1; }
 }
 
 @media (prefers-reduced-motion: reduce) {
